@@ -1,0 +1,11 @@
+{
+  "name": "paycheck-budget-planner",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy --config .deploy/Paycheck-Local-v1.0.0/dist/server/wrangler.json"
+  },
+  "devDependencies": {
+    "wrangler": "4.120.1"
+  }
+}
