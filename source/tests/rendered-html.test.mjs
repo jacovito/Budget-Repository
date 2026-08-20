@@ -36,6 +36,9 @@ test("renders development preview metadata", async () => {
   assert.match(html, /Safe to spend/i);
   assert.match(html, /Monthly/);
   assert.match(html, /Yearly/);
+  assert.match(html, /Interactive budget category wheel/);
+  assert.match(html, /Previous month/);
+  assert.match(html, /Next month/);
   assert.match(html, /Private by design/);
   assert.match(html, /Saving &amp; help/);
   assert.match(html, /manifest\.webmanifest/);

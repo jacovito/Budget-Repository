@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent } from "react";
 import { backupNeedsPassword, createBackup, readBackup } from "./backup";
 import { deleteProfile, listProfiles, loadPlan, putProfile, requestPersistentStorage, savePlan, type LocalProfile } from "./local-store";
+import { evaluateMoneyExpression } from "./math-expression";
 
 type Income = { id: string; name: string; owner: string; amount: number };
 type Allocation = {
@@ -49,8 +50,8 @@ const initialPlan: Plan = {
     { id: "extra", name: "Extra income", owner: "Household", amount: 0 },
   ],
   allocations: [
-    { id: "tithe", name: "Tithe", group: "Giving & tax", amount: 0 },
-    { id: "tax", name: "Tax reserve", group: "Giving & tax", amount: 0 },
+    { id: "tithe", name: "Tithe", group: "Giving", amount: 0 },
+    { id: "tax", name: "Tax reserve", group: "Tax", amount: 0 },
     { id: "rent", name: "Rent", group: "Home & bills", amount: 0, linked: "calendar" },
     { id: "fpl", name: "Electricity / FPL", group: "Home & bills", amount: 0, linked: "calendar" },
     { id: "car-insurance", name: "Car insurance", group: "Home & bills", amount: 0, linked: "calendar" },
@@ -109,10 +110,14 @@ const initialPlan: Plan = {
 function normalizeMonth(raw?: Partial<MonthSnapshot> | null): MonthSnapshot {
   return {
     incomes: initialPlan.incomes.map((seed) => ({ ...seed, ...(raw?.incomes || []).find((item) => item.id === seed.id) })),
-    allocations: initialPlan.allocations.map((seed) => ({ ...seed, ...(raw?.allocations || []).find((item) => item.id === seed.id) })),
+    allocations: initialPlan.allocations.map((seed) => {
+      const saved = (raw?.allocations || []).find((item) => item.id === seed.id);
+      return { ...seed, ...saved, group: seed.group, linked: seed.linked };
+    }),
     bills: raw?.bills || structuredClone(initialPlan.bills),
     debts: raw?.debts || structuredClone(initialPlan.debts),
     goals: raw?.goals || structuredClone(initialPlan.goals),
+    investmentMonthly: raw?.investmentMonthly || 0,
     investmentBuckets: raw?.investmentBuckets || structuredClone(initialPlan.investmentBuckets),
     assets: raw?.assets || structuredClone(initialPlan.assets),
     transactions: raw?.transactions || [],
@@ -151,7 +156,7 @@ function summarizeMonth(plan: MonthSnapshot) {
     return all;
   }, {});
   const spent = plan.transactions.reduce((sum, item) => sum + item.amount, 0);
-  const protectedGroups = ["Giving & tax", "Home & bills", "Debt", "Goals", "Investing"];
+  const protectedGroups = ["Giving", "Tax", "Home & bills", "Debt", "Goals", "Investing"];
   const remainingProtected = protectedGroups.reduce(
     (sum, group) => sum + Math.max(0, (groups[group] || 0) - (spentGroups[group] || 0)),
     0,
@@ -185,13 +190,14 @@ const navItems = [
   ["learn", "i", "Saving & help"],
 ] as const;
 
-const groupMeta: Record<string, { color: string; soft: string }> = {
-  "Giving & tax": { color: "#a46a3f", soft: "#f5eadf" },
-  "Home & bills": { color: "#246a73", soft: "#dfeff0" },
-  Lifestyle: { color: "#a6545f", soft: "#f5e2e5" },
-  Debt: { color: "#7950a4", soft: "#eee5f7" },
-  Goals: { color: "#2f7d5b", soft: "#e0f0e8" },
-  Investing: { color: "#305da8", soft: "#e1eafb" },
+const groupMeta: Record<string, { color: string; soft: string; icon: string }> = {
+  Giving: { color: "#ef7a32", soft: "#fff0e6", icon: "♡" },
+  Tax: { color: "#9b6ee0", soft: "#f1e9fb", icon: "%" },
+  "Home & bills": { color: "#3aa7df", soft: "#e4f4fb", icon: "⌂" },
+  Lifestyle: { color: "#d5be38", soft: "#f8f3d9", icon: "☕" },
+  Debt: { color: "#ed4f34", soft: "#fde8e3", icon: "↔" },
+  Goals: { color: "#39bf70", soft: "#e3f6ea", icon: "◎" },
+  Investing: { color: "#079e90", soft: "#def3ef", icon: "↗" },
 };
 
 const money = new Intl.NumberFormat("en-US", {
@@ -212,19 +218,47 @@ function CurrencyInput({
   ariaLabel: string;
   disabled?: boolean;
 }) {
+  const [draft, setDraft] = useState(value ? String(value) : "");
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setDraft(value ? String(value) : "");
+  }, [value]);
+
+  function commit(nextDraft: string) {
+    const parsed = evaluateMoneyExpression(nextDraft);
+    if (parsed === null) {
+      setDraft(value ? String(value) : "");
+      return;
+    }
+    setDraft(parsed ? String(parsed) : "");
+    onChange(parsed);
+  }
+
   return (
-    <label className={disabled ? "money-input disabled" : "money-input"}>
+    <label className={disabled ? "money-input disabled" : "money-input"} title="You can enter a number or calculation, such as =1200+350">
       <span>$</span>
       <input
         aria-label={ariaLabel}
         inputMode="decimal"
-        min="0"
-        type="number"
+        type="text"
         disabled={disabled}
-        value={value || ""}
-        placeholder="0"
-        onChange={(event) => onChange(Math.max(0, Number(event.target.value) || 0))}
+        value={draft}
+        placeholder="0 or =100+25"
+        onFocus={() => { focused.current = true; }}
+        onBlur={() => { focused.current = false; commit(draft); }}
+        onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+        onChange={(event) => {
+          const nextDraft = event.target.value;
+          setDraft(nextDraft);
+          if (!nextDraft.trim()) onChange(0);
+          else {
+            const parsed = evaluateMoneyExpression(nextDraft);
+            if (parsed !== null) onChange(parsed);
+          }
+        }}
       />
+      <small aria-hidden="true">fx</small>
     </label>
   );
 }
@@ -235,6 +269,22 @@ function NumberInput({ value, onChange, ariaLabel, suffix }: { value: number; on
       <input aria-label={ariaLabel} inputMode="decimal" min="0" type="number" value={value || ""} placeholder="0" onChange={(event) => onChange(Math.max(0, Number(event.target.value) || 0))} />
       {suffix && <span>{suffix}</span>}
     </label>
+  );
+}
+
+function MonthNavigator({ value, onChange }: { value: string; onChange: (next: string) => void }) {
+  function shift(delta: number) {
+    const [year, month] = value.split("-").map(Number);
+    const next = new Date(year, month - 1 + delta, 1);
+    onChange(`${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}`);
+  }
+
+  return (
+    <div className="month-navigator">
+      <button aria-label="Previous month" onClick={() => shift(-1)}>‹</button>
+      <label className="month-picker"><span>Month</span><input type="month" value={value} onChange={(event) => onChange(event.target.value)} /></label>
+      <button aria-label="Next month" onClick={() => shift(1)}>›</button>
+    </div>
   );
 }
 
@@ -252,6 +302,7 @@ export default function Home() {
   const [plan, setPlan] = useState<Plan>(initialPlan);
   const [dashboardView, setDashboardView] = useState<"monthly" | "yearly">("monthly");
   const [dashboardYear, setDashboardYear] = useState(Number(initialPlan.month.slice(0, 4)));
+  const [selectedDashboardGroup, setSelectedDashboardGroup] = useState("Home & bills");
   const [ready, setReady] = useState(false);
   const [profiles, setProfiles] = useState<LocalProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState("");
@@ -268,6 +319,13 @@ export default function Home() {
     categoryId: "misc",
     owner: "Jacobo",
     amount: 0,
+  });
+  const [billDraft, setBillDraft] = useState({
+    name: "",
+    categoryId: "subscriptions",
+    amount: 0,
+    dueDay: 1,
+    frequency: "Monthly" as Bill["frequency"],
   });
 
   useEffect(() => {
@@ -360,7 +418,7 @@ export default function Home() {
     const income = activeMonths.reduce((sum, item) => sum + item.totals.income, 0);
     const allocated = activeMonths.reduce((sum, item) => sum + item.totals.allocated, 0);
     const spent = activeMonths.reduce((sum, item) => sum + item.totals.spent, 0);
-    const protectedGroups = ["Giving & tax", "Home & bills", "Debt", "Goals", "Investing"];
+    const protectedGroups = ["Giving", "Tax", "Home & bills", "Debt", "Goals", "Investing"];
     const remainingProtected = protectedGroups.reduce(
       (sum, group) => sum + Math.max(0, (groups[group] || 0) - (spentGroups[group] || 0)),
       0,
@@ -403,13 +461,22 @@ export default function Home() {
   const bucketPercent = plan.investmentBuckets.reduce((sum, bucket) => sum + bucket.percent, 0);
 
   const dashboardBudget = dashboardTotals.allocated || dashboardTotals.income;
-  const spentPercent = dashboardBudget ? Math.min(100, dashboardTotals.spent / dashboardBudget * 100) : 0;
   const dashboardPeriodLabel = dashboardView === "monthly" ? monthLabel : `${dashboardYear} YEAR`;
   const dashboardCategories = Object.keys(groupMeta).map((group) => ({
     group,
     budget: dashboardTotals.groups[group] || 0,
     spent: dashboardTotals.spentGroups[group] || 0,
   }));
+  const selectedDashboardCategory = dashboardCategories.find((item) => item.group === selectedDashboardGroup) ?? dashboardCategories[0];
+  const wheelWeightFloor = Math.max(dashboardCategories.reduce((sum, item) => sum + item.budget, 0) * 0.035, 1);
+  const wheelWeightTotal = dashboardCategories.reduce((sum, item) => sum + Math.max(item.budget, wheelWeightFloor), 0);
+  let wheelCursor = 0;
+  const wheelSegments = dashboardCategories.map((item) => {
+    const length = 350 * Math.max(item.budget, wheelWeightFloor) / wheelWeightTotal;
+    const segment = { ...item, offset: wheelCursor, length: Math.max(8, length - 4) };
+    wheelCursor += length;
+    return segment;
+  });
 
   function changeMonth(nextMonth: string) {
     if (!nextMonth || nextMonth === plan.month) return;
@@ -446,23 +513,74 @@ export default function Home() {
   }
 
   function updateAllocation(id: string, amount: number) {
-    setPlan((current) => ({
-      ...current,
-      allocations: current.allocations.map((item) =>
-        item.id === id ? { ...item, amount } : item,
-      ),
-    }));
+    setPlan((current) => {
+      const matchingBills = current.bills.filter((bill) => bill.categoryId === id);
+      const bills = matchingBills.length === 1
+        ? current.bills.map((bill) => bill.id === matchingBills[0].id
+          ? { ...bill, amount: bill.frequency === "Annual" ? amount * 12 : amount }
+          : bill)
+        : current.bills;
+      return {
+        ...current,
+        bills,
+        allocations: current.allocations.map((item) => item.id === id ? { ...item, amount } : item),
+      };
+    });
   }
 
   function updateBill(id: string, patch: Partial<Bill>) {
     setPlan((current) => {
+      const previous = current.bills.find((bill) => bill.id === id);
       const bills = current.bills.map((bill) => (bill.id === id ? { ...bill, ...patch } : bill));
-      const linked = bills.reduce<Record<string, number>>((all, bill) => {
-        const monthlyAmount = bill.frequency === "Annual" ? bill.amount / 12 : bill.amount;
-        all[bill.categoryId] = (all[bill.categoryId] || 0) + monthlyAmount;
-        return all;
-      }, {});
-      return { ...current, bills, allocations: current.allocations.map((item) => item.linked === "calendar" ? { ...item, amount: linked[item.id] || 0 } : item) };
+      const affected = new Set([previous?.categoryId, patch.categoryId].filter(Boolean));
+      return {
+        ...current,
+        bills,
+        allocations: current.allocations.map((item) => affected.has(item.id)
+          ? { ...item, amount: bills.filter((bill) => bill.categoryId === item.id).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0) }
+          : item),
+      };
+    });
+  }
+
+  function addBill() {
+    if (!billDraft.name.trim() || billDraft.amount <= 0) {
+      setNotice("Add a name and amount for the recurring expense.");
+      return;
+    }
+    const bill: Bill = {
+      id: `bill-${crypto.randomUUID()}`,
+      name: billDraft.name.trim(),
+      categoryId: billDraft.categoryId,
+      amount: billDraft.amount,
+      dueDay: billDraft.dueDay,
+      frequency: billDraft.frequency,
+      ...(billDraft.frequency === "Annual" ? { dueMonth: selectedMonth } : {}),
+    };
+    setPlan((current) => {
+      const bills = [...current.bills, bill];
+      const categoryTotal = bills.filter((item) => item.categoryId === bill.categoryId).reduce((sum, item) => sum + (item.frequency === "Annual" ? item.amount / 12 : item.amount), 0);
+      return {
+        ...current,
+        bills,
+        allocations: current.allocations.map((item) => item.id === bill.categoryId ? { ...item, amount: categoryTotal } : item),
+      };
+    });
+    setBillDraft({ name: "", categoryId: "subscriptions", amount: 0, dueDay: 1, frequency: "Monthly" });
+    setNotice(`${bill.name} was added to ${monthLabel}.`);
+  }
+
+  function deleteBill(id: string) {
+    setPlan((current) => {
+      const removed = current.bills.find((bill) => bill.id === id);
+      if (!removed) return current;
+      const bills = current.bills.filter((bill) => bill.id !== id);
+      const categoryTotal = bills.filter((bill) => bill.categoryId === removed.categoryId).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
+      return {
+        ...current,
+        bills,
+        allocations: current.allocations.map((item) => item.id === removed.categoryId ? { ...item, amount: categoryTotal } : item),
+      };
     });
   }
 
@@ -685,7 +803,7 @@ export default function Home() {
                 <button className={dashboardView === "yearly" ? "active" : ""} onClick={() => setDashboardView("yearly")}>Yearly</button>
               </div>
               {dashboardView === "monthly" ? (
-                <label className="month-picker"><span>Month</span><input type="month" value={plan.month} onChange={(event) => changeMonth(event.target.value)} /></label>
+                <MonthNavigator value={plan.month} onChange={changeMonth} />
               ) : (
                 <div className="year-picker">
                   <label><span>Year</span><select value={dashboardYear} onChange={(event) => setDashboardYear(Number(event.target.value))}>{plan.years.map((year) => <option value={year} key={year}>{year}</option>)}</select></label>
@@ -694,7 +812,7 @@ export default function Home() {
               )}
             </div>
           )}
-          {active !== "dashboard" && active !== "learn" && <label className="month-picker"><span>Month</span><input type="month" value={plan.month} onChange={(event) => changeMonth(event.target.value)} /></label>}
+          {active !== "dashboard" && active !== "learn" && <MonthNavigator value={plan.month} onChange={changeMonth} />}
         </header>
 
         {active === "dashboard" && (
@@ -706,20 +824,51 @@ export default function Home() {
               </div>
               <div className="spend-overview">
                 <div className="gauge-column">
-                  <div className="category-chips" aria-hidden="true">{Object.entries(groupMeta).map(([group, meta]) => <span style={{ background: meta.color }} key={group}>{group.slice(0, 1)}</span>)}</div>
-                  <div className="spend-gauge" style={{ "--spent-percent": `${spentPercent}%` } as CSSProperties}>
-                    <div><span>Safe to spend</span><strong>{money.format(dashboardTotals.safeToSpend)}</strong><small>{money.format(dashboardTotals.spent)} spent of {money.format(dashboardBudget)} planned</small></div>
+                  <div className="category-wheel">
+                    <svg viewBox="0 0 200 200" aria-label="Interactive budget category wheel">
+                      <circle className="wheel-track" cx="100" cy="100" r="74" pathLength="464" strokeDasharray="350 114" transform="rotate(135 100 100)" />
+                      {wheelSegments.map((segment) => (
+                        <circle
+                          aria-label={`${segment.group}: ${money.format(segment.spent)} spent of ${money.format(segment.budget)}`}
+                          className={selectedDashboardCategory.group === segment.group ? "wheel-segment selected" : "wheel-segment"}
+                          cx="100"
+                          cy="100"
+                          fill="none"
+                          key={segment.group}
+                          onClick={() => setSelectedDashboardGroup(segment.group)}
+                          onFocus={() => setSelectedDashboardGroup(segment.group)}
+                          onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedDashboardGroup(segment.group); }}
+                          onMouseEnter={() => setSelectedDashboardGroup(segment.group)}
+                          pathLength="464"
+                          r="74"
+                          role="button"
+                          stroke={groupMeta[segment.group].color}
+                          strokeDasharray={`${segment.length} ${464 - segment.length}`}
+                          strokeDashoffset={-segment.offset}
+                          tabIndex={0}
+                          transform="rotate(135 100 100)"
+                        ><title>{segment.group}</title></circle>
+                      ))}
+                    </svg>
+                    <div className="wheel-center" aria-live="polite">
+                      <span>Safe to spend</span>
+                      <strong>{money.format(dashboardTotals.safeToSpend)}</strong>
+                      <small>{money.format(dashboardTotals.spent)} spent of {money.format(dashboardBudget)} planned</small>
+                      <b style={{ color: groupMeta[selectedDashboardCategory.group].color }}>{groupMeta[selectedDashboardCategory.group].icon} {selectedDashboardCategory.group}</b>
+                    </div>
                   </div>
-                  <p>After remaining bills, giving, debt, savings, and investing are protected.</p>
+                  <div className="wheel-key">{dashboardCategories.map(({ group }) => <button className={selectedDashboardCategory.group === group ? "active" : ""} style={{ "--category-color": groupMeta[group].color } as CSSProperties} key={group} onClick={() => setSelectedDashboardGroup(group)}><span>{groupMeta[group].icon}</span>{group}</button>)}</div>
+                  <p>Every segment is live. Select one to highlight it; changing income, rent, bills, giving, tax, or transactions recalculates the wheel immediately.</p>
                 </div>
                 <div className="spending-categories">
                   <div className="spending-head"><span>Spending categories</span><span>Spent</span><span>Budget</span></div>
                   {dashboardCategories.map(({ group, budget, spent }) => {
                     const progress = budget ? Math.min(100, spent / budget * 100) : 0;
-                    return <div className={spent > budget && budget > 0 ? "spending-row over" : "spending-row"} key={group}>
-                      <div className="spending-line"><span className="category-badge" style={{ color: groupMeta[group].color, background: groupMeta[group].soft }}>{group.slice(0, 1)}</span><strong>{group}</strong><b>{money.format(spent)}</b><span>/ {money.format(budget)}</span></div>
+                    const rowClass = `${spent > budget && budget > 0 ? "spending-row over" : "spending-row"}${selectedDashboardCategory.group === group ? " selected" : ""}`;
+                    return <button className={rowClass} key={group} onClick={() => setSelectedDashboardGroup(group)} onMouseEnter={() => setSelectedDashboardGroup(group)}>
+                      <div className="spending-line"><span className="category-badge" style={{ color: groupMeta[group].color, background: groupMeta[group].soft }}>{groupMeta[group].icon}</span><strong>{group}</strong><b>{money.format(spent)}</b><span>/ {money.format(budget)}</span></div>
                       <div className="category-track"><span style={{ width: `${progress}%`, background: groupMeta[group].color }} /></div>
-                    </div>;
+                    </button>;
                   })}
                 </div>
               </div>
@@ -795,7 +944,7 @@ export default function Home() {
 
               <section className="panel category-panel">
                 <div className="panel-heading"><div><p className="eyebrow">MONEY OUT</p><h2>Monthly plan</h2></div><strong>{money.format(totals.allocated)}</strong></div>
-                <p className="section-note">Categories come from your workbook. Enter only what you want to allocate this month.</p>
+                <p className="section-note">Every amount is editable for this month—even rent and calendar-linked bills. Past months stay unchanged.</p>
                 {Object.keys(groupMeta).map((group) => (
                   <div className="category-group" key={group}>
                     <div className="category-title" style={{ background: groupMeta[group].soft }}>
@@ -807,9 +956,9 @@ export default function Home() {
                       <div className="category-row" key={item.id}>
                         <span>
                           {item.name}
-                          {item.linked && <button className="linked-label" onClick={() => setActive(item.linked!)}>Linked · open</button>}
+                          {item.linked && <button className="linked-label" onClick={() => setActive(item.linked!)}>Also shown in {item.linked === "calendar" ? "calendar" : item.linked} →</button>}
                         </span>
-                        <CurrencyInput value={item.amount} onChange={(amount) => updateAllocation(item.id, amount)} ariaLabel={`${item.name} monthly allocation`} disabled={Boolean(item.linked)} />
+                        <CurrencyInput value={item.amount} onChange={(amount) => updateAllocation(item.id, amount)} ariaLabel={`${item.name} monthly allocation`} />
                       </div>
                     ))}
                   </div>
@@ -840,13 +989,22 @@ export default function Home() {
                 </div>
               </section>
               <section className="panel bill-list-panel">
-                <div className="panel-heading"><div><p className="eyebrow">RECURRING</p><h2>Bills & subscriptions</h2></div></div>
-                <p className="section-note">Annual items add one-twelfth to the monthly budget and appear in their due month.</p>
+                <div className="panel-heading"><div><p className="eyebrow">RECURRING</p><h2>Bills & subscriptions</h2></div><span className="live-pill">Editable</span></div>
+                <p className="section-note">Add a subscription or bill here. Changes apply to {monthLabel}; annual items appear in the selected month and contribute one-twelfth to the monthly plan.</p>
+                <div className="recurring-form">
+                  <label className="recurring-name"><span>Name</span><input value={billDraft.name} placeholder="New subscription" onChange={(event) => setBillDraft((current) => ({ ...current, name: event.target.value }))} /></label>
+                  <label><span>Category</span><select value={billDraft.categoryId} onChange={(event) => setBillDraft((current) => ({ ...current, categoryId: event.target.value }))}><option value="subscriptions">Subscriptions</option><option value="rent">Rent</option><option value="fpl">Electricity / FPL</option><option value="car-insurance">Car insurance</option></select></label>
+                  <label><span>Frequency</span><select value={billDraft.frequency} onChange={(event) => setBillDraft((current) => ({ ...current, frequency: event.target.value as Bill["frequency"] }))}><option value="Monthly">Monthly</option><option value="Annual">Annual</option></select></label>
+                  <label className="compact-field"><span>Due</span><input aria-label="New recurring expense due day" type="number" min="1" max="28" value={billDraft.dueDay} onChange={(event) => setBillDraft((current) => ({ ...current, dueDay: Math.min(28, Math.max(1, Number(event.target.value) || 1)) }))} /></label>
+                  <CurrencyInput value={billDraft.amount} onChange={(amount) => setBillDraft((current) => ({ ...current, amount }))} ariaLabel="New recurring expense amount" />
+                  <button className="add-recurring-button" onClick={addBill}>+ Add</button>
+                </div>
                 <div className="bill-list">
                   {plan.bills.map((bill) => <div className="bill-row" id={bill.id} key={bill.id}>
-                    <div><strong>{bill.name}</strong><small>{plan.allocations.find((item) => item.id === bill.categoryId)?.name}</small></div>
+                    <div><strong>{bill.name}</strong><small>{plan.allocations.find((item) => item.id === bill.categoryId)?.name} · {bill.frequency}</small></div>
                     <label className="compact-field"><span>Due</span><input aria-label={`${bill.name} due day`} type="number" min="1" max="28" value={bill.dueDay} onChange={(event) => updateBill(bill.id, { dueDay: Math.min(28, Math.max(1, Number(event.target.value) || 1)) })} /></label>
                     <CurrencyInput value={bill.amount} onChange={(amount) => updateBill(bill.id, { amount })} ariaLabel={`${bill.name} amount`} />
+                    <button className="delete-bill-button" aria-label={`Delete ${bill.name}`} onClick={() => deleteBill(bill.id)}>×</button>
                   </div>)}
                 </div>
               </section>

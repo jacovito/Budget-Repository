@@ -15,13 +15,19 @@ Local profiles organize records on one browser; they are not password-protected 
 ## Connected calculations
 
 - `available = income - allocations`.
-- Recurring bills update linked budget categories.
+- Recurring bills update linked budget categories. Users may still override a category in Monthly Budget for the selected month.
+- Giving and Tax are separate protected categories throughout monthly and yearly calculations.
+- Calendar supports monthly and annual recurring expenses. Annual expenses contribute one-twelfth of their amount to the monthly plan and remain identified by their selected due month.
 - Debt minimum and extra payments update linked debt allocations.
 - Goal contributions update Savings.
 - Monthly investing updates Stocks & investing.
 - Assets minus connected debt produce net worth.
-- `safe to spend = income - recorded spending - remaining protected allocations` for bills, giving/tax, debt, goals, and investing.
+- `safe to spend = income - recorded spending - remaining protected allocations` for bills, giving, tax, debt, goals, and investing.
 - Yearly totals aggregate only months that have been opened and saved in the selected year; the latest saved month supplies the year-end net-worth snapshot.
+
+The dashboard category wheel is a visualization of these same derived values, not a second data store. Clicking a wheel segment or category row changes the highlighted detail without changing the budget.
+
+Money inputs pass through `app/math-expression.ts`. Its small arithmetic parser supports decimal numbers, currency separators, parentheses, and `+`, `-`, `*`, `/`; it does not execute JavaScript or arbitrary formulas.
 
 Do not create duplicate totals that users must synchronize manually. Add a field once, then derive every view that consumes it.
 

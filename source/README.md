@@ -9,6 +9,10 @@ It is **not a Chrome extension**. It is a website that can also be installed fro
 - IndexedDB stores independent household budgets in the current browser profile.
 - Every month is saved separately. New months reuse the current budget structure and recurring settings, while starting with an empty transaction list.
 - The yearly dashboard totals the saved months for the selected year.
+- Previous/next arrows move one month at a time; the month field still supports direct selection.
+- The dashboard category wheel and rows are derived from the same live plan as Monthly Budget, Calendar, Giving, Tax, Debt, Goals, and Investing.
+- Recurring bills and subscriptions can be added, edited, or removed from Calendar. Monthly Budget amounts remain editable for month-specific changes.
+- Money inputs accept a number or a simple expression such as `=1200+350`, `(100+25)*2`, or `$2,000/4`.
 - A `.paycheck` export is a portable manual backup. Standard and password-protected backups are supported, and restore always creates a separate budget.
 - There is no account system, bank connection, or automatic cloud sync in this version.
 
