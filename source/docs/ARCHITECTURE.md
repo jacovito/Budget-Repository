@@ -14,7 +14,10 @@ Local profiles organize records on one browser; they are not password-protected 
 
 ## Connected calculations
 
-- `available = income - allocations`.
+- `available = income - expected allocations`.
+- Dashboard spending is the sum of category-level Actual amounts, not the sum of a required transaction ledger.
+- Calendar-linked bills and debt-linked payments default to automatic Actual amounts equal to Expected. Giving, Tax, Goals, Investing, and flexible categories default to a blank Actual amount each new month.
+- A manual Actual edit becomes authoritative for that month. Optional transactions increment or decrement the selected category’s Actual total when added or removed.
 - Recurring bills update linked budget categories. Users may still override a category in Monthly Budget for the selected month.
 - Giving and Tax are separate protected categories throughout monthly and yearly calculations.
 - Calendar supports monthly and annual recurring expenses. Annual expenses contribute one-twelfth of their amount to the monthly plan and remain identified by their selected due month.
@@ -22,10 +25,14 @@ Local profiles organize records on one browser; they are not password-protected 
 - Goal contributions update Savings.
 - Monthly investing updates Stocks & investing.
 - Assets minus connected debt produce net worth.
-- `safe to spend = income - recorded spending - remaining protected allocations` for bills, giving, tax, debt, goals, and investing.
+- `safe to spend = income - actual spending - remaining protected allocations` for bills, giving, tax, debt, goals, and investing.
 - Yearly totals aggregate only months that have been opened and saved in the selected year; the latest saved month supplies the year-end net-worth snapshot.
 
 The dashboard category wheel is a visualization of these same derived values, not a second data store. Clicking a wheel segment or category row changes the highlighted detail without changing the budget.
+
+Expected defaults are stored separately from month snapshots. A “This month only” edit stays in its snapshot; a “This & future months” edit updates the default and any already-saved future snapshots. New months reset automatic fixed Actual amounts to Expected and leave manual categories blank.
+
+Adding or archiving a liability transforms only the active and future snapshots. Historical snapshots remain untouched so earlier yearly and net-worth records are preserved.
 
 Money inputs pass through `app/math-expression.ts`. Its small arithmetic parser supports decimal numbers, currency separators, parentheses, and `+`, `-`, `*`, `/`; it does not execute JavaScript or arbitrary formulas.
 

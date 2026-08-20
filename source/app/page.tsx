@@ -11,6 +11,8 @@ type Allocation = {
   name: string;
   group: string;
   amount: number;
+  actual?: number | null;
+  actualMode?: "auto" | "manual";
   linked?: "calendar" | "debt" | "goals" | "investing";
 };
 type Bill = { id: string; name: string; categoryId: string; amount: number; dueDay: number; frequency: "Monthly" | "Annual"; dueMonth?: number };
@@ -36,6 +38,7 @@ type Plan = MonthSnapshot & {
   month: string;
   months: Record<string, MonthSnapshot>;
   years: number[];
+  expectedDefaults: Record<string, number>;
 };
 
 const LEGACY_STORAGE_KEY = "paycheck-plan-v1";
@@ -59,6 +62,7 @@ const initialPlan: Plan = {
     { id: "fun", name: "Fun", group: "Lifestyle", amount: 0 },
     { id: "health", name: "Dentist & health", group: "Lifestyle", amount: 0 },
     { id: "misc", name: "Miscellaneous", group: "Lifestyle", amount: 0 },
+    { id: "unexpected", name: "Unexpected", group: "Lifestyle", amount: 0 },
     { id: "credit-card", name: "Credit card payment", group: "Debt", amount: 0, linked: "debt" },
     { id: "car-payment", name: "Vehicle payment", group: "Debt", amount: 0, linked: "debt" },
     { id: "saving", name: "Savings", group: "Goals", amount: 0, linked: "goals" },
@@ -105,15 +109,46 @@ const initialPlan: Plan = {
   transactions: [],
   months: {},
   years: [2026],
+  expectedDefaults: {},
 };
 
+function usesAutomaticActual(item: Allocation) {
+  return item.linked === "calendar" || item.linked === "debt";
+}
+
+function normalizeAllocation(item: Allocation): Allocation {
+  const automatic = usesAutomaticActual(item);
+  const hasActual = Object.prototype.hasOwnProperty.call(item, "actual");
+  return {
+    ...item,
+    actual: hasActual ? item.actual ?? null : automatic ? item.amount : null,
+    actualMode: item.actualMode ?? (automatic ? "auto" : "manual"),
+  };
+}
+
 function normalizeMonth(raw?: Partial<MonthSnapshot> | null): MonthSnapshot {
+  const savedAllocations = raw?.allocations || [];
+  const seedIds = new Set(initialPlan.allocations.map((item) => item.id));
+  const seeded = initialPlan.allocations.map((seed) => {
+    const saved = savedAllocations.find((item) => item.id === seed.id);
+    return normalizeAllocation({ ...seed, ...saved, group: seed.group, linked: seed.linked });
+  });
+  const custom = savedAllocations.filter((item) => !seedIds.has(item.id)).map((item) => normalizeAllocation(item));
+  const transactionTotals = (raw?.transactions || []).reduce<Record<string, number>>((totals, transaction) => {
+    totals[transaction.categoryId] = (totals[transaction.categoryId] || 0) + transaction.amount;
+    return totals;
+  }, {});
+  const allocations = [...seeded, ...custom].map((item) => {
+    const saved = savedAllocations.find((candidate) => candidate.id === item.id);
+    const alreadyHadActual = saved ? Object.prototype.hasOwnProperty.call(saved, "actual") : false;
+    const legacyTransactionTotal = transactionTotals[item.id] || 0;
+    return !alreadyHadActual && !usesAutomaticActual(item) && item.group !== "Giving" && item.group !== "Tax" && legacyTransactionTotal > 0
+      ? { ...item, actual: legacyTransactionTotal, actualMode: "manual" as const }
+      : item;
+  });
   return {
     incomes: initialPlan.incomes.map((seed) => ({ ...seed, ...(raw?.incomes || []).find((item) => item.id === seed.id) })),
-    allocations: initialPlan.allocations.map((seed) => {
-      const saved = (raw?.allocations || []).find((item) => item.id === seed.id);
-      return { ...seed, ...saved, group: seed.group, linked: seed.linked };
-    }),
+    allocations,
     bills: raw?.bills || structuredClone(initialPlan.bills),
     debts: raw?.debts || structuredClone(initialPlan.debts),
     goals: raw?.goals || structuredClone(initialPlan.goals),
@@ -126,6 +161,7 @@ function normalizeMonth(raw?: Partial<MonthSnapshot> | null): MonthSnapshot {
 
 function normalizePlan(raw?: Partial<Plan> | null): Plan {
   const month = raw?.month || initialPlan.month;
+  const current = normalizeMonth(raw);
   const months = Object.fromEntries(
     Object.entries(raw?.months || {}).map(([key, value]) => [key, normalizeMonth(value)]),
   );
@@ -134,13 +170,54 @@ function normalizePlan(raw?: Partial<Plan> | null): Plan {
     Number(month.slice(0, 4)),
     ...Object.keys(months).map((key) => Number(key.slice(0, 4))),
   ])].filter(Number.isFinite).sort((a, b) => a - b);
-  return { month, ...normalizeMonth(raw), months, years };
+  const expectedDefaults = {
+    ...Object.fromEntries(current.allocations.map((item) => [item.id, item.amount])),
+    ...(raw?.expectedDefaults || {}),
+  };
+  return { month, ...current, months, years, expectedDefaults };
 }
 
 function monthSnapshot(plan: MonthSnapshot): MonthSnapshot { return normalizeMonth(plan); }
 
-function nextMonthSnapshot(plan: MonthSnapshot): MonthSnapshot {
-  return { ...monthSnapshot(plan), transactions: [] };
+function setExpectedOnSnapshot(raw: MonthSnapshot, id: string, amount: number): MonthSnapshot {
+  const snapshot = monthSnapshot(raw);
+  const target = snapshot.allocations.find((item) => item.id === id);
+  if (!target) return snapshot;
+  const matchingBills = snapshot.bills.filter((bill) => bill.categoryId === id);
+  const matchingDebts = snapshot.debts.filter((debt) => debt.categoryId === id);
+  const bills = matchingBills.length === 1
+    ? snapshot.bills.map((bill) => bill.id === matchingBills[0].id ? { ...bill, amount: bill.frequency === "Annual" ? amount * 12 : amount } : bill)
+    : snapshot.bills;
+  const debts = matchingDebts.length === 1
+    ? snapshot.debts.map((debt) => {
+      if (debt.id !== matchingDebts[0].id) return debt;
+      return amount >= debt.minimum ? { ...debt, extra: amount - debt.minimum } : { ...debt, minimum: amount, extra: 0 };
+    })
+    : snapshot.debts;
+  return {
+    ...snapshot,
+    bills,
+    debts,
+    allocations: snapshot.allocations.map((item) => item.id === id ? {
+      ...item,
+      amount,
+      actual: usesAutomaticActual(item) && item.actualMode === "auto" ? amount : item.actual,
+    } : item),
+  };
+}
+
+function nextMonthSnapshot(plan: MonthSnapshot, expectedDefaults: Record<string, number>): MonthSnapshot {
+  let next = monthSnapshot(plan);
+  for (const [id, amount] of Object.entries(expectedDefaults)) next = setExpectedOnSnapshot(next, id, amount);
+  return {
+    ...next,
+    allocations: next.allocations.map((item) => ({
+      ...item,
+      actual: usesAutomaticActual(item) ? item.amount : null,
+      actualMode: usesAutomaticActual(item) ? "auto" : "manual",
+    })),
+    transactions: [],
+  };
 }
 
 function summarizeMonth(plan: MonthSnapshot) {
@@ -150,12 +227,11 @@ function summarizeMonth(plan: MonthSnapshot) {
     all[item.group] = (all[item.group] || 0) + item.amount;
     return all;
   }, {});
-  const spentGroups = plan.transactions.reduce<Record<string, number>>((all, transaction) => {
-    const group = plan.allocations.find((item) => item.id === transaction.categoryId)?.group || "Lifestyle";
-    all[group] = (all[group] || 0) + transaction.amount;
+  const spentGroups = plan.allocations.reduce<Record<string, number>>((all, item) => {
+    all[item.group] = (all[item.group] || 0) + (item.actual ?? 0);
     return all;
   }, {});
-  const spent = plan.transactions.reduce((sum, item) => sum + item.amount, 0);
+  const spent = plan.allocations.reduce((sum, item) => sum + (item.actual ?? 0), 0);
   const protectedGroups = ["Giving", "Tax", "Home & bills", "Debt", "Goals", "Investing"];
   const remainingProtected = protectedGroups.reduce(
     (sum, group) => sum + Math.max(0, (groups[group] || 0) - (spentGroups[group] || 0)),
@@ -176,7 +252,7 @@ function summarizeMonth(plan: MonthSnapshot) {
     netWorth: assets - debt,
   };
 }
-function freshPlan(): Plan { return structuredClone(initialPlan); }
+function freshPlan(): Plan { return normalizePlan(structuredClone(initialPlan)); }
 
 const navItems = [
   ["dashboard", "⌂", "Dashboard"],
@@ -263,6 +339,56 @@ function CurrencyInput({
   );
 }
 
+function ActualCurrencyInput({ value, onChange, ariaLabel }: { value: number | null | undefined; onChange: (next: number | null) => void; ariaLabel: string }) {
+  const [draft, setDraft] = useState(value === null || value === undefined ? "" : String(value));
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setDraft(value === null || value === undefined ? "" : String(value));
+  }, [value]);
+
+  function commit(nextDraft: string) {
+    if (!nextDraft.trim()) {
+      setDraft("");
+      onChange(null);
+      return;
+    }
+    const parsed = evaluateMoneyExpression(nextDraft);
+    if (parsed === null) {
+      setDraft(value === null || value === undefined ? "" : String(value));
+      return;
+    }
+    setDraft(String(parsed));
+    onChange(parsed);
+  }
+
+  return (
+    <label className="money-input actual-input" title="Enter the total actually spent, or a calculation such as =100+25">
+      <span>$</span>
+      <input
+        aria-label={ariaLabel}
+        inputMode="decimal"
+        type="text"
+        value={draft}
+        placeholder="Actual"
+        onFocus={() => { focused.current = true; }}
+        onBlur={() => { focused.current = false; commit(draft); }}
+        onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+        onChange={(event) => {
+          const nextDraft = event.target.value;
+          setDraft(nextDraft);
+          if (!nextDraft.trim()) onChange(null);
+          else {
+            const parsed = evaluateMoneyExpression(nextDraft);
+            if (parsed !== null) onChange(parsed);
+          }
+        }}
+      />
+      <small aria-hidden="true">fx</small>
+    </label>
+  );
+}
+
 function NumberInput({ value, onChange, ariaLabel, suffix }: { value: number; onChange: (next: number) => void; ariaLabel: string; suffix?: string }) {
   return (
     <label className="number-input">
@@ -307,6 +433,8 @@ export default function Home() {
   const [profiles, setProfiles] = useState<LocalProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [expectedEditorOpen, setExpectedEditorOpen] = useState(false);
+  const [expectedScope, setExpectedScope] = useState<"month" | "future">("month");
   const [newProfileName, setNewProfileName] = useState("");
   const [backupPassword, setBackupPassword] = useState("");
   const [notice, setNotice] = useState("");
@@ -316,7 +444,7 @@ export default function Home() {
   const [transactionDraft, setTransactionDraft] = useState({
     date: "2026-08-01",
     description: "",
-    categoryId: "misc",
+    categoryId: "unexpected",
     owner: "Jacobo",
     amount: 0,
   });
@@ -327,6 +455,7 @@ export default function Home() {
     dueDay: 1,
     frequency: "Monthly" as Bill["frequency"],
   });
+  const [debtDraft, setDebtDraft] = useState({ name: "", balance: 0, apr: 0, minimum: 0, extra: 0 });
 
   useEffect(() => {
     let cancelled = false;
@@ -388,6 +517,10 @@ export default function Home() {
   const activeProfile = profiles.find((profile) => profile.id === activeProfileId);
 
   const totals = useMemo(() => summarizeMonth(plan), [plan]);
+  const visibleAllocations = useMemo(
+    () => plan.allocations.filter((item) => item.linked !== "debt" || plan.debts.some((debt) => debt.categoryId === item.id)),
+    [plan.allocations, plan.debts],
+  );
 
   const savedMonths = useMemo(
     () => ({ ...plan.months, [plan.month]: monthSnapshot(plan) }),
@@ -482,7 +615,7 @@ export default function Home() {
     if (!nextMonth || nextMonth === plan.month) return;
     setPlan((current) => {
       const months = { ...current.months, [current.month]: monthSnapshot(current) };
-      const next = months[nextMonth] ? monthSnapshot(months[nextMonth]) : nextMonthSnapshot(current);
+      const next = months[nextMonth] ? monthSnapshot(months[nextMonth]) : nextMonthSnapshot(current, current.expectedDefaults);
       const year = Number(nextMonth.slice(0, 4));
       return {
         ...current,
@@ -512,33 +645,63 @@ export default function Home() {
     }));
   }
 
-  function updateAllocation(id: string, amount: number) {
+  function updateExpected(id: string, amount: number) {
     setPlan((current) => {
-      const matchingBills = current.bills.filter((bill) => bill.categoryId === id);
-      const bills = matchingBills.length === 1
-        ? current.bills.map((bill) => bill.id === matchingBills[0].id
-          ? { ...bill, amount: bill.frequency === "Annual" ? amount * 12 : amount }
-          : bill)
-        : current.bills;
+      const updated = setExpectedOnSnapshot(current, id, amount);
+      const months = expectedScope === "future"
+        ? Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [
+          key,
+          key >= current.month ? setExpectedOnSnapshot(snapshot, id, amount) : snapshot,
+        ]))
+        : current.months;
       return {
         ...current,
-        bills,
-        allocations: current.allocations.map((item) => item.id === id ? { ...item, amount } : item),
+        ...updated,
+        months,
+        expectedDefaults: expectedScope === "future" ? { ...current.expectedDefaults, [id]: amount } : current.expectedDefaults,
       };
     });
   }
 
+  function updateActual(id: string, actual: number | null) {
+    setPlan((current) => ({
+      ...current,
+      allocations: current.allocations.map((item) => item.id === id ? { ...item, actual, actualMode: "manual" } : item),
+    }));
+  }
+
+  function resetActualToExpected(id: string) {
+    setPlan((current) => ({
+      ...current,
+      allocations: current.allocations.map((item) => item.id === id ? { ...item, actual: item.amount, actualMode: "auto" } : item),
+    }));
+  }
+
   function updateBill(id: string, patch: Partial<Bill>) {
     setPlan((current) => {
-      const previous = current.bills.find((bill) => bill.id === id);
-      const bills = current.bills.map((bill) => (bill.id === id ? { ...bill, ...patch } : bill));
-      const affected = new Set([previous?.categoryId, patch.categoryId].filter(Boolean));
+      const applyToSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
+        const snapshot = monthSnapshot(raw);
+        const previous = snapshot.bills.find((bill) => bill.id === id);
+        if (!previous) return snapshot;
+        const bills = snapshot.bills.map((bill) => (bill.id === id ? { ...bill, ...patch } : bill));
+        const affected = new Set([previous.categoryId, patch.categoryId].filter(Boolean));
+        return {
+          ...snapshot,
+          bills,
+          allocations: snapshot.allocations.map((item) => affected.has(item.id)
+            ? (() => {
+              const amount = bills.filter((bill) => bill.categoryId === item.id).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
+              return { ...item, amount, actual: item.actualMode === "auto" ? amount : item.actual };
+            })()
+            : item),
+        };
+      };
+      const updated = applyToSnapshot(current);
       return {
         ...current,
-        bills,
-        allocations: current.allocations.map((item) => affected.has(item.id)
-          ? { ...item, amount: bills.filter((bill) => bill.categoryId === item.id).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0) }
-          : item),
+        ...updated,
+        months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? applyToSnapshot(snapshot) : snapshot])),
+        expectedDefaults: { ...current.expectedDefaults, ...Object.fromEntries(updated.allocations.filter((item) => item.linked === "calendar").map((item) => [item.id, item.amount])) },
       };
     });
   }
@@ -558,12 +721,20 @@ export default function Home() {
       ...(billDraft.frequency === "Annual" ? { dueMonth: selectedMonth } : {}),
     };
     setPlan((current) => {
-      const bills = [...current.bills, bill];
-      const categoryTotal = bills.filter((item) => item.categoryId === bill.categoryId).reduce((sum, item) => sum + (item.frequency === "Annual" ? item.amount / 12 : item.amount), 0);
+      const addToSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
+        const snapshot = monthSnapshot(raw);
+        if (snapshot.bills.some((item) => item.id === bill.id)) return snapshot;
+        const bills = [...snapshot.bills, bill];
+        const categoryTotal = bills.filter((item) => item.categoryId === bill.categoryId).reduce((sum, item) => sum + (item.frequency === "Annual" ? item.amount / 12 : item.amount), 0);
+        return { ...snapshot, bills, allocations: snapshot.allocations.map((item) => item.id === bill.categoryId ? { ...item, amount: categoryTotal, actual: item.actualMode === "auto" ? categoryTotal : item.actual } : item) };
+      };
+      const updated = addToSnapshot(current);
+      const categoryTotal = updated.allocations.find((item) => item.id === bill.categoryId)?.amount ?? 0;
       return {
         ...current,
-        bills,
-        allocations: current.allocations.map((item) => item.id === bill.categoryId ? { ...item, amount: categoryTotal } : item),
+        ...updated,
+        months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? addToSnapshot(snapshot) : snapshot])),
+        expectedDefaults: { ...current.expectedDefaults, [bill.categoryId]: categoryTotal },
       };
     });
     setBillDraft({ name: "", categoryId: "subscriptions", amount: 0, dueDay: 1, frequency: "Monthly" });
@@ -574,12 +745,19 @@ export default function Home() {
     setPlan((current) => {
       const removed = current.bills.find((bill) => bill.id === id);
       if (!removed) return current;
-      const bills = current.bills.filter((bill) => bill.id !== id);
-      const categoryTotal = bills.filter((bill) => bill.categoryId === removed.categoryId).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
+      const removeFromSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
+        const snapshot = monthSnapshot(raw);
+        const bills = snapshot.bills.filter((bill) => bill.id !== id);
+        const categoryTotal = bills.filter((bill) => bill.categoryId === removed.categoryId).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
+        return { ...snapshot, bills, allocations: snapshot.allocations.map((item) => item.id === removed.categoryId ? { ...item, amount: categoryTotal, actual: item.actualMode === "auto" ? categoryTotal : item.actual } : item) };
+      };
+      const updated = removeFromSnapshot(current);
+      const categoryTotal = updated.allocations.find((item) => item.id === removed.categoryId)?.amount ?? 0;
       return {
         ...current,
-        bills,
-        allocations: current.allocations.map((item) => item.id === removed.categoryId ? { ...item, amount: categoryTotal } : item),
+        ...updated,
+        months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? removeFromSnapshot(snapshot) : snapshot])),
+        expectedDefaults: { ...current.expectedDefaults, [removed.categoryId]: categoryTotal },
       };
     });
   }
@@ -587,18 +765,76 @@ export default function Home() {
   function updateDebt(id: string, patch: Partial<Debt>) {
     setPlan((current) => {
       const debts = current.debts.map((debt) => (debt.id === id ? { ...debt, ...patch } : debt));
-      return { ...current, debts, allocations: current.allocations.map((item) => {
+      const allocations = current.allocations.map((item) => {
         const linkedDebt = debts.find((debt) => debt.categoryId === item.id);
-        return linkedDebt ? { ...item, amount: linkedDebt.minimum + linkedDebt.extra } : item;
-      }) };
+        if (!linkedDebt) return item;
+        const amount = linkedDebt.minimum + linkedDebt.extra;
+        return { ...item, amount, actual: item.actualMode === "auto" ? amount : item.actual };
+      });
+      return {
+        ...current,
+        debts,
+        allocations,
+        expectedDefaults: { ...current.expectedDefaults, ...Object.fromEntries(allocations.filter((item) => item.linked === "debt").map((item) => [item.id, item.amount])) },
+      };
     });
+  }
+
+  function addDebt() {
+    if (!debtDraft.name.trim()) { setNotice("Add a name for the liability."); return; }
+    const id = `liability-${crypto.randomUUID()}`;
+    const categoryId = `debt-${crypto.randomUUID()}`;
+    const debt: Debt = { id, categoryId, name: debtDraft.name.trim(), balance: debtDraft.balance, apr: debtDraft.apr, minimum: debtDraft.minimum, extra: debtDraft.extra };
+    const amount = debt.minimum + debt.extra;
+    const allocation: Allocation = { id: categoryId, name: `${debt.name} payment`, group: "Debt", amount, actual: amount, actualMode: "auto", linked: "debt" };
+    const addToSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
+      const snapshot = monthSnapshot(raw);
+      return { ...snapshot, debts: [...snapshot.debts, debt], allocations: [...snapshot.allocations, allocation] };
+    };
+    setPlan((current) => ({
+      ...current,
+      ...addToSnapshot(current),
+      months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? addToSnapshot(snapshot) : snapshot])),
+      expectedDefaults: { ...current.expectedDefaults, [categoryId]: amount },
+    }));
+    setDebtDraft({ name: "", balance: 0, apr: 0, minimum: 0, extra: 0 });
+    setNotice(`${debt.name} was added to the debt plan.`);
+  }
+
+  function archiveDebt(id: string) {
+    const debt = plan.debts.find((item) => item.id === id);
+    if (!debt || !window.confirm(`Remove “${debt.name}” from this month and future months? Past months will keep their history.`)) return;
+    const seededCategory = initialPlan.allocations.some((item) => item.id === debt.categoryId);
+    const removeFromSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
+      const snapshot = monthSnapshot(raw);
+      return {
+        ...snapshot,
+        debts: snapshot.debts.filter((item) => item.id !== id),
+        allocations: seededCategory
+          ? snapshot.allocations.map((item) => item.id === debt.categoryId ? { ...item, amount: 0, actual: 0, actualMode: "auto" } : item)
+          : snapshot.allocations.filter((item) => item.id !== debt.categoryId),
+      };
+    };
+    setPlan((current) => {
+      const expectedDefaults = { ...current.expectedDefaults };
+      if (seededCategory) expectedDefaults[debt.categoryId] = 0;
+      else delete expectedDefaults[debt.categoryId];
+      return {
+        ...current,
+        ...removeFromSnapshot(current),
+        months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? removeFromSnapshot(snapshot) : snapshot])),
+        expectedDefaults,
+      };
+    });
+    setTransactionDraft((current) => current.categoryId === debt.categoryId ? { ...current, categoryId: "unexpected" } : current);
+    setNotice(`${debt.name} was removed. Earlier months were preserved.`);
   }
 
   function updateGoal(id: string, patch: Partial<Goal>) {
     setPlan((current) => {
       const goals = current.goals.map((goal) => (goal.id === id ? { ...goal, ...patch } : goal));
       const monthly = goals.reduce((sum, goal) => sum + goal.monthly, 0);
-      return { ...current, goals, allocations: current.allocations.map((item) => item.id === "saving" ? { ...item, amount: monthly } : item) };
+      return { ...current, goals, expectedDefaults: { ...current.expectedDefaults, saving: monthly }, allocations: current.allocations.map((item) => item.id === "saving" ? { ...item, amount: monthly } : item) };
     });
   }
 
@@ -606,6 +842,7 @@ export default function Home() {
     setPlan((current) => ({
       ...current,
       investmentMonthly: amount,
+      expectedDefaults: { ...current.expectedDefaults, stocks: amount },
       allocations: current.allocations.map((item) => item.id === "stocks" ? { ...item, amount } : item),
     }));
   }
@@ -615,8 +852,21 @@ export default function Home() {
     setPlan((current) => ({
       ...current,
       transactions: [{ ...transactionDraft, id: `transaction-${Date.now()}` }, ...current.transactions],
+      allocations: current.allocations.map((item) => item.id === transactionDraft.categoryId ? { ...item, actual: (item.actual ?? 0) + transactionDraft.amount, actualMode: "manual" } : item),
     }));
     setTransactionDraft((current) => ({ ...current, description: "", amount: 0 }));
+  }
+
+  function deleteTransaction(id: string) {
+    setPlan((current) => {
+      const transaction = current.transactions.find((item) => item.id === id);
+      if (!transaction) return current;
+      return {
+        ...current,
+        transactions: current.transactions.filter((item) => item.id !== id),
+        allocations: current.allocations.map((item) => item.id === transaction.categoryId ? { ...item, actual: Math.max(0, (item.actual ?? 0) - transaction.amount), actualMode: "manual" } : item),
+      };
+    });
   }
 
   async function switchProfile(profileId: string) {
@@ -858,7 +1108,7 @@ export default function Home() {
                     </div>
                   </div>
                   <div className="wheel-key">{dashboardCategories.map(({ group }) => <button className={selectedDashboardCategory.group === group ? "active" : ""} style={{ "--category-color": groupMeta[group].color } as CSSProperties} key={group} onClick={() => setSelectedDashboardGroup(group)}><span>{groupMeta[group].icon}</span>{group}</button>)}</div>
-                  <p>Every segment is live. Select one to highlight it; changing income, rent, bills, giving, tax, or transactions recalculates the wheel immediately.</p>
+                  <p>Every segment is live. Select one to highlight it; changing an Expected or Actual amount recalculates the wheel immediately.</p>
                 </div>
                 <div className="spending-categories">
                   <div className="spending-head"><span>Spending categories</span><span>Spent</span><span>Budget</span></div>
@@ -922,10 +1172,9 @@ export default function Home() {
           <div className="budget-page">
             <section className="budget-summary">
               <div><span>Income</span><strong>{money.format(totals.income)}</strong></div>
-              <span className="summary-operator">−</span>
               <div><span>Planned</span><strong>{money.format(totals.allocated)}</strong></div>
-              <span className="summary-operator">=</span>
-              <div className={totals.available < 0 ? "negative" : "positive"}><span>Available</span><strong>{money.format(totals.available)}</strong></div>
+              <div><span>Actual</span><strong>{money.format(totals.spent)}</strong></div>
+              <div className={totals.available < 0 ? "negative" : "positive"}><span>Unassigned</span><strong>{money.format(totals.available)}</strong></div>
             </section>
 
             <div className="budget-columns">
@@ -943,24 +1192,31 @@ export default function Home() {
               </section>
 
               <section className="panel category-panel">
-                <div className="panel-heading"><div><p className="eyebrow">MONEY OUT</p><h2>Monthly plan</h2></div><strong>{money.format(totals.allocated)}</strong></div>
-                <p className="section-note">Every amount is editable for this month—even rent and calendar-linked bills. Past months stay unchanged.</p>
+                <div className="panel-heading"><div><p className="eyebrow">MONEY OUT</p><h2>Expected vs. actual</h2></div><div className="budget-panel-actions"><strong>{money.format(totals.spent)} actual</strong><button className={expectedEditorOpen ? "more-button active" : "more-button"} aria-label="Edit expected budget amounts" aria-expanded={expectedEditorOpen} onClick={() => setExpectedEditorOpen((open) => !open)}>{expectedEditorOpen ? "×" : "•••"}</button></div></div>
+                <p className="section-note">Fixed bills and debt payments start as already spent. Giving, Tax, and flexible categories stay blank until you enter an actual amount or add an optional transaction.</p>
+                {expectedEditorOpen && <section className="expected-editor" aria-label="Edit expected budget amounts">
+                  <div className="expected-editor-heading"><div><strong>Edit expected budget</strong><small>Choose where each change should apply.</small></div><div className="scope-toggle" role="group" aria-label="Expected budget change scope"><button className={expectedScope === "month" ? "active" : ""} onClick={() => setExpectedScope("month")}>This month only</button><button className={expectedScope === "future" ? "active" : ""} onClick={() => setExpectedScope("future")}>This & future months</button></div></div>
+                  <div className="expected-editor-list">{visibleAllocations.map((item) => <div className="expected-editor-row" key={item.id}><span><strong>{item.name}</strong><small>{item.group}</small></span><CurrencyInput value={item.amount} onChange={(amount) => updateExpected(item.id, amount)} ariaLabel={`${item.name} expected amount`} /></div>)}</div>
+                </section>}
+                <div className="budget-column-heads"><span>Category</span><span>Expected</span><span>Actual</span><span>Remaining</span></div>
                 {Object.keys(groupMeta).map((group) => (
                   <div className="category-group" key={group}>
                     <div className="category-title" style={{ background: groupMeta[group].soft }}>
                       <span className="group-dot" style={{ background: groupMeta[group].color }} />
                       <strong>{group}</strong>
-                      <span>{money.format(totals.groups[group] || 0)}</span>
+                      <span>{money.format(totals.groups[group] || 0)} planned</span>
+                      <span>{money.format(totals.spentGroups[group] || 0)} actual</span>
                     </div>
-                    {plan.allocations.filter((item) => item.group === group).map((item) => (
-                      <div className="category-row" key={item.id}>
-                        <span>
-                          {item.name}
-                          {item.linked && <button className="linked-label" onClick={() => setActive(item.linked!)}>Also shown in {item.linked === "calendar" ? "calendar" : item.linked} →</button>}
-                        </span>
-                        <CurrencyInput value={item.amount} onChange={(amount) => updateAllocation(item.id, amount)} ariaLabel={`${item.name} monthly allocation`} />
-                      </div>
-                    ))}
+                    {visibleAllocations.filter((item) => item.group === group).map((item) => {
+                      const actual = item.actual ?? 0;
+                      const remaining = item.amount - actual;
+                      return <div className="category-row" key={item.id}>
+                        <span className="category-name"><strong>{item.name}</strong>{item.linked && <button className="linked-label" onClick={() => setActive(item.linked!)}>Open {item.linked === "calendar" ? "calendar" : item.linked} details →</button>}</span>
+                        <span className="planned-cell">{money.format(item.amount)}</span>
+                        <span className="actual-cell"><ActualCurrencyInput value={item.actual} onChange={(amount) => updateActual(item.id, amount)} ariaLabel={`${item.name} actual amount`} />{usesAutomaticActual(item) && <small>{item.actualMode === "auto" ? "Automatic" : <button onClick={() => resetActualToExpected(item.id)}>Use expected</button>}</small>}</span>
+                        <strong className={remaining < 0 ? "remaining-cell over" : "remaining-cell"}>{money.format(remaining)}</strong>
+                      </div>;
+                    })}
                   </div>
                 ))}
               </section>
@@ -990,7 +1246,7 @@ export default function Home() {
               </section>
               <section className="panel bill-list-panel">
                 <div className="panel-heading"><div><p className="eyebrow">RECURRING</p><h2>Bills & subscriptions</h2></div><span className="live-pill">Editable</span></div>
-                <p className="section-note">Add a subscription or bill here. Changes apply to {monthLabel}; annual items appear in the selected month and contribute one-twelfth to the monthly plan.</p>
+                <p className="section-note">Add or change a recurring bill here for this and future months. Annual items appear in their selected month and contribute one-twelfth to the monthly plan.</p>
                 <div className="recurring-form">
                   <label className="recurring-name"><span>Name</span><input value={billDraft.name} placeholder="New subscription" onChange={(event) => setBillDraft((current) => ({ ...current, name: event.target.value }))} /></label>
                   <label><span>Category</span><select value={billDraft.categoryId} onChange={(event) => setBillDraft((current) => ({ ...current, categoryId: event.target.value }))}><option value="subscriptions">Subscriptions</option><option value="rent">Rent</option><option value="fpl">Electricity / FPL</option><option value="car-insurance">Car insurance</option></select></label>
@@ -1018,12 +1274,24 @@ export default function Home() {
               <div><p className="eyebrow">PAYOFF PLAN</p><h2>{money.format(totals.debt)} remaining</h2><span>{money.format(debtMonthly)} from the paycheck is assigned to debt each month.</span></div>
               <button className="primary-button" onClick={() => setActive("budget")}>See full paycheck →</button>
             </section>
+            <section className="panel liability-add-panel">
+              <div className="panel-heading"><div><p className="eyebrow">LIABILITIES</p><h2>Add a debt or loan</h2></div><span className="live-pill">Current & future</span></div>
+              <p className="section-note">Add credit cards, personal loans, vehicle loans, or other liabilities. Removing one later preserves earlier months.</p>
+              <div className="liability-form">
+                <label className="liability-name"><span>Name</span><input value={debtDraft.name} placeholder="Example: Personal loan" onChange={(event) => setDebtDraft((current) => ({ ...current, name: event.target.value }))} /></label>
+                <label><span>Balance</span><CurrencyInput value={debtDraft.balance} onChange={(balance) => setDebtDraft((current) => ({ ...current, balance }))} ariaLabel="New liability balance" /></label>
+                <label><span>APR</span><NumberInput value={debtDraft.apr} onChange={(apr) => setDebtDraft((current) => ({ ...current, apr }))} ariaLabel="New liability APR" suffix="%" /></label>
+                <label><span>Minimum</span><CurrencyInput value={debtDraft.minimum} onChange={(minimum) => setDebtDraft((current) => ({ ...current, minimum }))} ariaLabel="New liability minimum payment" /></label>
+                <label><span>Extra</span><CurrencyInput value={debtDraft.extra} onChange={(extra) => setDebtDraft((current) => ({ ...current, extra }))} ariaLabel="New liability extra payment" /></label>
+                <button className="add-recurring-button" onClick={addDebt}>+ Add liability</button>
+              </div>
+            </section>
             <div className="debt-grid">
               {plan.debts.map((debt) => {
                 const months = payoffMonths(debt);
                 const percent = totals.debt ? (debt.balance / totals.debt) * 100 : 0;
                 return <section className="panel debt-card" key={debt.id}>
-                  <div className="debt-card-head"><div><span className="debt-badge">{debt.name.slice(0, 2).toUpperCase()}</span><div><p>DEBT ACCOUNT</p><h2>{debt.name}</h2></div></div><strong>{money.format(debt.balance)}</strong></div>
+                  <div className="debt-card-head"><div><span className="debt-badge">{debt.name.slice(0, 2).toUpperCase()}</span><div><p>DEBT ACCOUNT</p><h2>{debt.name}</h2></div></div><div className="debt-card-actions"><strong>{money.format(debt.balance)}</strong><button aria-label={`Remove ${debt.name}`} onClick={() => archiveDebt(debt.id)}>Remove</button></div></div>
                   <div className="debt-track"><span style={{ width: `${percent}%` }} /></div>
                   <div className="field-grid">
                     <label><span>Current balance</span><CurrencyInput value={debt.balance} onChange={(balance) => updateDebt(debt.id, { balance })} ariaLabel={`${debt.name} current balance`} /></label>
@@ -1096,24 +1364,25 @@ export default function Home() {
         {active === "activity" && (
           <div className="module-page">
             <section className="transaction-entry panel">
-              <div className="panel-heading"><div><p className="eyebrow">QUICK ENTRY</p><h2>Add a transaction</h2></div><span className="live-pill">Browser only</span></div>
+              <div className="panel-heading"><div><p className="eyebrow">OPTIONAL QUICK ENTRY</p><h2>Fun or unexpected purchase</h2></div><span className="live-pill">Optional</span></div>
+              <p className="section-note">You do not need to enter rent, insurance, subscriptions, or every purchase. Use this only when a one-off expense is useful to remember; it adds to that category’s Actual total.</p>
               <div className="transaction-form">
                 <label><span>Date</span><input type="date" value={transactionDraft.date} onChange={(event) => setTransactionDraft((current) => ({ ...current, date: event.target.value }))} /></label>
                 <label className="description-field"><span>Description</span><input placeholder="Merchant or note" value={transactionDraft.description} onChange={(event) => setTransactionDraft((current) => ({ ...current, description: event.target.value }))} /></label>
-                <label><span>Category</span><select value={transactionDraft.categoryId} onChange={(event) => setTransactionDraft((current) => ({ ...current, categoryId: event.target.value }))}>{plan.allocations.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
+                <label><span>Category</span><select value={transactionDraft.categoryId} onChange={(event) => setTransactionDraft((current) => ({ ...current, categoryId: event.target.value }))}>{visibleAllocations.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
                 <label><span>Who</span><select value={transactionDraft.owner} onChange={(event) => setTransactionDraft((current) => ({ ...current, owner: event.target.value }))}><option>Jacobo</option><option>Partner</option><option>Household</option></select></label>
                 <label><span>Amount</span><CurrencyInput value={transactionDraft.amount} onChange={(amount) => setTransactionDraft((current) => ({ ...current, amount }))} ariaLabel="Transaction amount" /></label>
                 <button className="primary-button" onClick={addTransaction}>Add transaction</button>
               </div>
             </section>
             <section className="module-stats transaction-stats">
-              <article><span>Recorded spending</span><strong>{money.format(totals.spent)}</strong><small>{plan.transactions.length} transactions</small></article>
+              <article><span>Actual spending</span><strong>{money.format(totals.spent)}</strong><small>Includes automatic fixed expenses</small></article>
               <article><span>Planned spending</span><strong>{money.format(totals.allocated)}</strong><small>Includes saving and investing</small></article>
-              <article><span>Plan remaining</span><strong>{money.format(totals.allocated - totals.spent)}</strong><small>Against recorded activity</small></article>
+              <article><span>Optional entries</span><strong>{plan.transactions.length}</strong><small>Fun and unexpected purchases</small></article>
             </section>
             <section className="panel transaction-panel">
               <div className="panel-heading"><div><p className="eyebrow">ACTIVITY</p><h2>Household transactions</h2></div></div>
-              {plan.transactions.length === 0 ? <div className="empty-state"><span>≡</span><h3>No transactions yet</h3><p>Add the first expense above. It will be saved on this device.</p></div> : <div className="transaction-table"><div className="transaction-head"><span>Date</span><span>Description</span><span>Category</span><span>Owner</span><span>Amount</span><span /></div>{plan.transactions.map((transaction) => <div className="transaction-row" key={transaction.id}><span>{transaction.date}</span><strong>{transaction.description}</strong><span>{plan.allocations.find((item) => item.id === transaction.categoryId)?.name}</span><span>{transaction.owner}</span><strong>{money.format(transaction.amount)}</strong><button aria-label={`Delete ${transaction.description}`} onClick={() => setPlan((current) => ({ ...current, transactions: current.transactions.filter((item) => item.id !== transaction.id) }))}>×</button></div>)}</div>}
+              {plan.transactions.length === 0 ? <div className="empty-state"><span>≡</span><h3>No optional transactions</h3><p>That is okay—fixed expenses and direct Actual amounts already update the dashboard.</p></div> : <div className="transaction-table"><div className="transaction-head"><span>Date</span><span>Description</span><span>Category</span><span>Owner</span><span>Amount</span><span /></div>{plan.transactions.map((transaction) => <div className="transaction-row" key={transaction.id}><span>{transaction.date}</span><strong>{transaction.description}</strong><span>{plan.allocations.find((item) => item.id === transaction.categoryId)?.name}</span><span>{transaction.owner}</span><strong>{money.format(transaction.amount)}</strong><button aria-label={`Delete ${transaction.description}`} onClick={() => deleteTransaction(transaction.id)}>×</button></div>)}</div>}
             </section>
           </div>
         )}
