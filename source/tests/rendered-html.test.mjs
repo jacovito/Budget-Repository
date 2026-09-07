@@ -32,11 +32,13 @@ test("renders development preview metadata", async () => {
   const html = await response.text();
   assert.match(html, developmentPreviewMeta);
   assert.match(html, /Paycheck/);
-  assert.match(html, /Know what’s safe to spend\./);
-  assert.match(html, /Safe to spend/i);
+  assert.match(html, /Spending and monthly balance\./);
+  assert.match(html, /Projected monthly balance/i);
+  assert.match(html, /Actual spending summary/i);
+  assert.match(html, /Remaining bills this month/i);
+  assert.doesNotMatch(html, /Safe to spend/i);
   assert.match(html, /Monthly/);
   assert.match(html, /Yearly/);
-  assert.match(html, /Interactive budget category wheel/);
   assert.match(html, /Previous month/);
   assert.match(html, /Next month/);
   assert.match(html, /Private by design/);

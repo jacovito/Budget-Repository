@@ -14,23 +14,24 @@ Local profiles organize records on one browser; they are not password-protected 
 
 ## Connected calculations
 
-- `available = income - expected allocations`.
-- Dashboard spending is the sum of category-level Actual amounts, not the sum of a required transaction ledger.
-- Calendar-linked bills and debt-linked payments default to automatic Actual amounts equal to Expected. Giving, Tax, Goals, Investing, and flexible categories default to a blank Actual amount each new month.
-- A manual Actual edit becomes authoritative for that month. Optional transactions increment or decrement the selected category’s Actual total when added or removed.
-- Recurring bills update linked budget categories. Users may still override a category in Monthly Budget for the selected month.
-- Giving and Tax are separate protected categories throughout monthly and yearly calculations.
+- `total income = income received + income still expected`.
+- `projected balance = total income - actual spending - remaining included bills`.
+- Actual spending is the sum of imported/manual transactions, paid bills, and optional unitemized category totals.
+- Marking a bill paid removes it from remaining bills and adds its paid amount to actual spending, so the projection is unchanged unless the paid amount changes.
+- Category targets are optional, live only in Monthly Plan, and never feed the main balance calculation.
+- Giving and Tax remain separate actual-spending categories.
 - Calendar supports monthly and annual recurring expenses. Annual expenses contribute one-twelfth of their amount to the monthly plan and remain identified by their selected due month.
 - Debt minimum and extra payments update linked debt allocations.
 - Goal contributions update Savings.
 - Monthly investing updates Stocks & investing.
 - Assets minus connected debt produce net worth.
-- `safe to spend = income - actual spending - remaining protected allocations` for bills, giving, tax, debt, goals, and investing.
 - Yearly totals aggregate only months that have been opened and saved in the selected year; the latest saved month supplies the year-end net-worth snapshot.
 
-The dashboard category wheel is a visualization of these same derived values, not a second data store. Clicking a wheel segment or category row changes the highlighted detail without changing the budget.
+The dashboard category list is derived from the same transactions, bill statuses, and direct totals. Selecting a category opens the filtered transaction ledger.
 
-Expected defaults are stored separately from month snapshots. A “This month only” edit stays in its snapshot; a “This & future months” edit updates the default and any already-saved future snapshots. New months reset automatic fixed Actual amounts to Expected and leave manual categories blank.
+Target defaults are stored separately from month snapshots. A “This month only” edit stays in its snapshot; a “This & future months” edit updates the default and any already-saved future snapshots. New months reset actual spending and bill-paid statuses while carrying known bills forward.
+
+CSV statement parsing runs entirely in the browser. The importer recognizes common date, merchant, amount, and debit headings; the user can switch whether expenses are negative or positive. A stable date/merchant/amount/account fingerprint prevents duplicate imports. Built-in keyword rules and user-created rules handle categorization, and unmatched transactions are marked for review.
 
 Adding or archiving a liability transforms only the active and future snapshots. Historical snapshots remain untouched so earlier yearly and net-worth records are preserved.
 

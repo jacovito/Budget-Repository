@@ -10,12 +10,18 @@ It is **not a Chrome extension**. It is a website that can also be installed fro
 - Every month is saved separately. New months reuse the current budget structure and recurring settings, while starting with an empty transaction list.
 - The yearly dashboard totals the saved months for the selected year.
 - Previous/next arrows move one month at a time; the month field still supports direct selection.
-- The dashboard category wheel and rows are derived from the same live plan as Monthly Budget, Calendar, Giving, Tax, Debt, Goals, and Investing.
-- Monthly Budget keeps Expected and Actual separate. Calendar bills and debt payments begin each month with Actual equal to Expected; Giving, Tax, and flexible categories begin blank.
-- The three-dot Expected editor can change only the selected month or the selected month plus future months.
-- Recurring bills and subscriptions can be added, edited, or removed from Calendar. Monthly Budget amounts remain editable for month-specific changes.
+- The dashboard leads with `total monthly income - actual spending - remaining known bills = projected monthly balance`.
+- Income separates money already received from income still expected during the month.
+- Actual spending is grouped into Groceries, Gas, Fast Food, Restaurants, Bills, Subscriptions, Car / Transportation, Personal, Shopping, Other / Uncategorized, Giving, and Tax.
+- Monthly Plan is the only place category targets appear. Targets are optional and do not change actual spending or the projected balance.
+- Monthly targets can change only the selected month or the selected month plus future months.
+- Recurring bills and subscriptions can be added, edited, or removed from Calendar independently of optional Monthly Plan targets.
+- An unpaid bill is included in the projection by default. Marking it paid moves the same amount into actual spending without double-counting it.
 - Liabilities can be added or archived. Archiving removes them from the selected and future months without rewriting earlier monthly history.
-- Transactions are optional and intended for useful one-off records such as Fun, Miscellaneous, and Unexpected purchases; an entry adds to that category’s Actual total.
+- Transactions need only date, merchant, amount, category, and account/payment method.
+- CSV statement import detects common bank columns, separates expenses from credits, skips duplicates, and routes unknown merchants to Review Needed.
+- Built-in and user-created merchant rules categorize repeated purchases locally. No financial data is sent to an AI service.
+- Monthly savings targets are optional, editable, and compared with the projected month-end balance without being published as part of the app.
 - Money inputs accept a number or a simple expression such as `=1200+350`, `(100+25)*2`, or `$2,000/4`.
 - A `.paycheck` export is a portable manual backup. Standard and password-protected backups are supported, and restore always creates a separate budget.
 - There is no account system, bank connection, or automatic cloud sync in this version.

@@ -4,8 +4,19 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEv
 import { backupNeedsPassword, createBackup, readBackup } from "./backup";
 import { deleteProfile, listProfiles, loadPlan, putProfile, requestPersistentStorage, savePlan, type LocalProfile } from "./local-store";
 import { evaluateMoneyExpression } from "./math-expression";
+import {
+  categorizeMerchant,
+  defaultMerchantRules,
+  normalizeMerchant,
+  parseStatementCsv,
+  suggestedMerchantPattern,
+  transactionFingerprint,
+  type ImportAmountMode,
+  type MerchantRule,
+  type StatementTransaction,
+} from "./statement-import";
 
-type Income = { id: string; name: string; owner: string; amount: number };
+type Income = { id: string; name: string; owner: string; amount: number; expectedRemaining?: number };
 type Allocation = {
   id: string;
   name: string;
@@ -15,14 +26,45 @@ type Allocation = {
   actualMode?: "auto" | "manual";
   linked?: "calendar" | "debt" | "goals" | "investing";
 };
-type Bill = { id: string; name: string; categoryId: string; amount: number; dueDay: number; frequency: "Monthly" | "Annual"; dueMonth?: number };
+type Bill = {
+  id: string;
+  name: string;
+  categoryId: string;
+  amount: number;
+  dueDay: number;
+  frequency: "Monthly" | "Annual";
+  dueMonth?: number;
+  paid?: boolean;
+  paidAmount?: number;
+  includedInProjection?: boolean;
+  matchedTransactionId?: string;
+};
 type Debt = { id: string; name: string; categoryId: string; balance: number; apr: number; minimum: number; extra: number };
 type Goal = { id: string; name: string; current: number; target: number; monthly: number; targetDate: string };
 type InvestmentBucket = { id: string; name: string; percent: number };
 type Asset = { id: string; name: string; type: string; balance: number };
-type Transaction = { id: string; date: string; description: string; categoryId: string; owner: string; amount: number };
+type Transaction = {
+  id: string;
+  date: string;
+  description: string;
+  categoryId: string;
+  owner?: string;
+  account?: string;
+  amount: number;
+  source?: "manual" | "import";
+  reviewNeeded?: boolean;
+  fingerprint?: string;
+  billId?: string;
+};
+type ImportPreviewTransaction = StatementTransaction & {
+  id: string;
+  categoryId: string;
+  reviewNeeded: boolean;
+  duplicate: boolean;
+};
 
 type MonthSnapshot = {
+  dataVersion?: number;
   incomes: Income[];
   allocations: Allocation[];
   bills: Bill[];
@@ -39,30 +81,71 @@ type Plan = MonthSnapshot & {
   months: Record<string, MonthSnapshot>;
   years: number[];
   expectedDefaults: Record<string, number>;
+  merchantRules: MerchantRule[];
+  savingsTargets: { minimum: number; ideal: number };
 };
 
 const LEGACY_STORAGE_KEY = "paycheck-plan-v1";
 const ACTIVE_PROFILE_KEY = "paycheck-active-profile-v1";
+const DATA_VERSION = 3;
+
+const spendingCategories = [
+  { id: "groceries", name: "Groceries", color: "#2f8f67", soft: "#e4f4ec" },
+  { id: "gas", name: "Gas", color: "#cb7a2b", soft: "#fbefdf" },
+  { id: "fast-food", name: "Fast Food", color: "#d65b45", soft: "#fbe8e4" },
+  { id: "restaurants", name: "Restaurants", color: "#9a67c8", soft: "#f1e9f8" },
+  { id: "bills", name: "Bills", color: "#397db5", soft: "#e6f0f8" },
+  { id: "subscriptions", name: "Subscriptions", color: "#725dc1", soft: "#ece9f8" },
+  { id: "car-transportation", name: "Car / Transportation", color: "#2f9aa0", soft: "#e1f3f3" },
+  { id: "personal", name: "Personal", color: "#ba6d87", soft: "#f8e9ee" },
+  { id: "shopping", name: "Shopping", color: "#b08a2e", soft: "#f7f0dd" },
+  { id: "other-uncategorized", name: "Other / Uncategorized", color: "#71817d", soft: "#edf1ef" },
+  { id: "giving", name: "Giving", color: "#e27739", soft: "#fcece2" },
+  { id: "tax", name: "Tax", color: "#6f63a8", soft: "#eceaf5" },
+] as const;
+
+const spendingCategoryIds = new Set<string>(spendingCategories.map((category) => category.id));
+const legacyAllocationMap: Record<string, string> = {
+  tithe: "giving",
+  rent: "bills",
+  fpl: "bills",
+  "car-insurance": "car-transportation",
+  fun: "personal",
+  health: "personal",
+  misc: "other-uncategorized",
+  unexpected: "other-uncategorized",
+};
+
+function canonicalSpendingCategory(id: string) {
+  if (spendingCategoryIds.has(id)) return id;
+  if (legacyAllocationMap[id]) return legacyAllocationMap[id];
+  if (id === "car-payment") return "car-transportation";
+  if (id === "credit-card" || id.startsWith("debt-")) return "bills";
+  return "other-uncategorized";
+}
 
 const initialPlan: Plan = {
+  dataVersion: DATA_VERSION,
   month: "2026-08",
   incomes: [
-    { id: "palau", name: "Palau", owner: "Jacobo", amount: 0 },
-    { id: "hawkeye", name: "Hawkeye", owner: "Jacobo", amount: 0 },
-    { id: "partner", name: "Partner income", owner: "Partner", amount: 0 },
-    { id: "extra", name: "Extra income", owner: "Household", amount: 0 },
+    { id: "income-primary", name: "Primary income", owner: "Me", amount: 0 },
+    { id: "income-secondary", name: "Secondary income", owner: "Me", amount: 0 },
+    { id: "income-partner", name: "Partner income", owner: "Partner", amount: 0 },
+    { id: "income-other", name: "Other income", owner: "Household", amount: 0 },
   ],
   allocations: [
-    { id: "tithe", name: "Tithe", group: "Giving", amount: 0 },
-    { id: "tax", name: "Tax reserve", group: "Tax", amount: 0 },
-    { id: "rent", name: "Rent", group: "Home & bills", amount: 0, linked: "calendar" },
-    { id: "fpl", name: "Electricity / FPL", group: "Home & bills", amount: 0, linked: "calendar" },
-    { id: "car-insurance", name: "Car insurance", group: "Home & bills", amount: 0, linked: "calendar" },
-    { id: "subscriptions", name: "Subscriptions", group: "Home & bills", amount: 0, linked: "calendar" },
-    { id: "fun", name: "Fun", group: "Lifestyle", amount: 0 },
-    { id: "health", name: "Dentist & health", group: "Lifestyle", amount: 0 },
-    { id: "misc", name: "Miscellaneous", group: "Lifestyle", amount: 0 },
-    { id: "unexpected", name: "Unexpected", group: "Lifestyle", amount: 0 },
+    { id: "groceries", name: "Groceries", group: "Spending", amount: 0 },
+    { id: "gas", name: "Gas", group: "Spending", amount: 0 },
+    { id: "fast-food", name: "Fast Food", group: "Spending", amount: 0 },
+    { id: "restaurants", name: "Restaurants", group: "Spending", amount: 0 },
+    { id: "bills", name: "Bills", group: "Spending", amount: 0 },
+    { id: "subscriptions", name: "Subscriptions", group: "Spending", amount: 0 },
+    { id: "car-transportation", name: "Car / Transportation", group: "Spending", amount: 0 },
+    { id: "personal", name: "Personal", group: "Spending", amount: 0 },
+    { id: "shopping", name: "Shopping", group: "Spending", amount: 0 },
+    { id: "other-uncategorized", name: "Other / Uncategorized", group: "Spending", amount: 0 },
+    { id: "giving", name: "Giving", group: "Giving", amount: 0 },
+    { id: "tax", name: "Tax", group: "Tax", amount: 0 },
     { id: "credit-card", name: "Credit card payment", group: "Debt", amount: 0, linked: "debt" },
     { id: "car-payment", name: "Vehicle payment", group: "Debt", amount: 0, linked: "debt" },
     { id: "saving", name: "Savings", group: "Goals", amount: 0, linked: "goals" },
@@ -70,19 +153,9 @@ const initialPlan: Plan = {
     { id: "funded", name: "Funded-account fees", group: "Investing", amount: 0 },
   ],
   bills: [
-    { id: "bill-rent", name: "Rent", categoryId: "rent", amount: 0, dueDay: 1, frequency: "Monthly" },
-    { id: "bill-fpl", name: "Electricity / FPL", categoryId: "fpl", amount: 0, dueDay: 12, frequency: "Monthly" },
-    { id: "bill-insurance", name: "Car insurance", categoryId: "car-insurance", amount: 0, dueDay: 18, frequency: "Monthly" },
-    { id: "natural-cycles", name: "Natural Cycles", categoryId: "subscriptions", amount: 0, dueDay: 3, frequency: "Monthly" },
-    { id: "oura", name: "Oura Ring", categoryId: "subscriptions", amount: 0, dueDay: 5, frequency: "Monthly" },
-    { id: "coinbase", name: "Coinbase", categoryId: "subscriptions", amount: 0, dueDay: 8, frequency: "Monthly" },
-    { id: "chatgpt", name: "ChatGPT", categoryId: "subscriptions", amount: 0, dueDay: 10, frequency: "Monthly" },
-    { id: "kindle", name: "Kindle Unlimited", categoryId: "subscriptions", amount: 0, dueDay: 14, frequency: "Monthly" },
-    { id: "apple-n", name: "Apple Storage — Partner", categoryId: "subscriptions", amount: 0, dueDay: 16, frequency: "Monthly" },
-    { id: "apple-j", name: "Apple Storage — Jacobo", categoryId: "subscriptions", amount: 0, dueDay: 16, frequency: "Monthly" },
-    { id: "spotify-n", name: "Spotify — Partner", categoryId: "subscriptions", amount: 0, dueDay: 22, frequency: "Monthly" },
-    { id: "spotify-j", name: "Spotify — Jacobo", categoryId: "subscriptions", amount: 0, dueDay: 22, frequency: "Monthly" },
-    { id: "sircon", name: "Vertafore / Sircon", categoryId: "subscriptions", amount: 0, dueDay: 27, frequency: "Annual", dueMonth: 1 },
+    { id: "bill-rent", name: "Rent", categoryId: "bills", amount: 0, dueDay: 1, frequency: "Monthly", paid: false, includedInProjection: true },
+    { id: "bill-electricity", name: "Electricity", categoryId: "bills", amount: 0, dueDay: 12, frequency: "Monthly", paid: false, includedInProjection: true },
+    { id: "bill-insurance", name: "Car insurance", categoryId: "car-transportation", amount: 0, dueDay: 18, frequency: "Monthly", paid: false, includedInProjection: true },
   ],
   debts: [
     { id: "credit-card-debt", name: "Credit card", categoryId: "credit-card", balance: 0, apr: 0, minimum: 0, extra: 0 },
@@ -101,61 +174,94 @@ const initialPlan: Plan = {
   assets: [
     { id: "checking", name: "Checking", type: "Cash", balance: 0 },
     { id: "savings-account", name: "Savings", type: "Cash", balance: 0 },
-    { id: "tam", name: "Tam Company", type: "Business", balance: 0 },
-    { id: "coinbase-asset", name: "Coinbase", type: "Crypto", balance: 0 },
-    { id: "bluefin", name: "Bluefin", type: "Investments", balance: 0 },
-    { id: "vehicle", name: "Vehicle", type: "Property", balance: 0 },
+    { id: "business", name: "Business", type: "Business", balance: 0 },
+    { id: "investments", name: "Investments", type: "Investments", balance: 0 },
+    { id: "property", name: "Property", type: "Property", balance: 0 },
   ],
   transactions: [],
   months: {},
   years: [2026],
   expectedDefaults: {},
+  merchantRules: [],
+  savingsTargets: { minimum: 0, ideal: 0 },
 };
 
-function usesAutomaticActual(item: Allocation) {
-  return item.linked === "calendar" || item.linked === "debt";
-}
-
 function normalizeAllocation(item: Allocation): Allocation {
-  const automatic = usesAutomaticActual(item);
-  const hasActual = Object.prototype.hasOwnProperty.call(item, "actual");
   return {
     ...item,
-    actual: hasActual ? item.actual ?? null : automatic ? item.amount : null,
-    actualMode: item.actualMode ?? (automatic ? "auto" : "manual"),
+    actual: Object.prototype.hasOwnProperty.call(item, "actual") ? item.actual ?? null : null,
+    actualMode: "manual",
   };
 }
 
 function normalizeMonth(raw?: Partial<MonthSnapshot> | null): MonthSnapshot {
   const savedAllocations = raw?.allocations || [];
+  const isCurrentModel = raw?.dataVersion === DATA_VERSION;
   const seedIds = new Set(initialPlan.allocations.map((item) => item.id));
-  const seeded = initialPlan.allocations.map((seed) => {
-    const saved = savedAllocations.find((item) => item.id === seed.id);
-    return normalizeAllocation({ ...seed, ...saved, group: seed.group, linked: seed.linked });
+  const transactions = (raw?.transactions || []).map((transaction) => ({
+    ...transaction,
+    categoryId: canonicalSpendingCategory(transaction.categoryId),
+    account: transaction.account || transaction.owner || "Household",
+    source: transaction.source || "manual" as const,
+    reviewNeeded: transaction.reviewNeeded ?? canonicalSpendingCategory(transaction.categoryId) === "other-uncategorized",
+    fingerprint: transaction.fingerprint || transactionFingerprint(
+      transaction.date,
+      transaction.description,
+      transaction.amount,
+      transaction.account || transaction.owner || "Household",
+    ),
+  }));
+  const bills = (raw?.bills || structuredClone(initialPlan.bills)).map((bill) => {
+    const legacyAllocation = savedAllocations.find((item) => item.id === bill.categoryId);
+    const inferredPaid = !isCurrentModel && legacyAllocation?.actualMode === "auto" && (legacyAllocation.actual ?? 0) > 0;
+    const paid = bill.paid ?? inferredPaid;
+    return {
+      ...bill,
+      categoryId: canonicalSpendingCategory(bill.categoryId),
+      paid,
+      paidAmount: paid ? bill.paidAmount ?? bill.amount : bill.paidAmount,
+      includedInProjection: bill.includedInProjection ?? true,
+    };
   });
-  const custom = savedAllocations.filter((item) => !seedIds.has(item.id)).map((item) => normalizeAllocation(item));
-  const transactionTotals = (raw?.transactions || []).reduce<Record<string, number>>((totals, transaction) => {
+  const transactionTotals = transactions.reduce<Record<string, number>>((totals, transaction) => {
     totals[transaction.categoryId] = (totals[transaction.categoryId] || 0) + transaction.amount;
     return totals;
   }, {});
-  const allocations = [...seeded, ...custom].map((item) => {
-    const saved = savedAllocations.find((candidate) => candidate.id === item.id);
-    const alreadyHadActual = saved ? Object.prototype.hasOwnProperty.call(saved, "actual") : false;
-    const legacyTransactionTotal = transactionTotals[item.id] || 0;
-    return !alreadyHadActual && !usesAutomaticActual(item) && item.group !== "Giving" && item.group !== "Tax" && legacyTransactionTotal > 0
-      ? { ...item, actual: legacyTransactionTotal, actualMode: "manual" as const }
-      : item;
+  const paidBillTotals = bills.filter((bill) => bill.paid).reduce<Record<string, number>>((totals, bill) => {
+    totals[bill.categoryId] = (totals[bill.categoryId] || 0) + (bill.paidAmount ?? bill.amount);
+    return totals;
+  }, {});
+  const seeded = initialPlan.allocations.map((seed) => {
+    const sources = savedAllocations.filter((item) => (legacyAllocationMap[item.id] || item.id) === seed.id);
+    if (sources.length === 0) return normalizeAllocation(seed);
+    if (isCurrentModel) {
+      const saved = sources.find((item) => item.id === seed.id) || sources[0];
+      return normalizeAllocation({ ...seed, ...saved, group: seed.group, linked: seed.linked });
+    }
+    const amount = sources.reduce((sum, item) => sum + (item.amount || 0), 0);
+    const legacyActual = sources.reduce((sum, item) => sum + (item.actual ?? 0), 0);
+    const isSpending = spendingCategoryIds.has(seed.id);
+    const actual = isSpending
+      ? Math.max(0, legacyActual - (transactionTotals[seed.id] || 0) - (paidBillTotals[seed.id] || 0))
+      : legacyActual || null;
+    return normalizeAllocation({ ...seed, amount, actual, group: seed.group, linked: seed.linked });
   });
+  const custom = savedAllocations
+    .filter((item) => !seedIds.has(item.id) && !legacyAllocationMap[item.id])
+    .map((item) => normalizeAllocation(item));
   return {
-    incomes: initialPlan.incomes.map((seed) => ({ ...seed, ...(raw?.incomes || []).find((item) => item.id === seed.id) })),
-    allocations,
-    bills: raw?.bills || structuredClone(initialPlan.bills),
+    dataVersion: DATA_VERSION,
+    incomes: raw?.incomes?.length
+      ? raw.incomes.map((item) => ({ expectedRemaining: 0, ...item }))
+      : structuredClone(initialPlan.incomes),
+    allocations: [...seeded, ...custom],
+    bills,
     debts: raw?.debts || structuredClone(initialPlan.debts),
     goals: raw?.goals || structuredClone(initialPlan.goals),
     investmentMonthly: raw?.investmentMonthly || 0,
     investmentBuckets: raw?.investmentBuckets || structuredClone(initialPlan.investmentBuckets),
     assets: raw?.assets || structuredClone(initialPlan.assets),
-    transactions: raw?.transactions || [],
+    transactions,
   };
 }
 
@@ -174,7 +280,18 @@ function normalizePlan(raw?: Partial<Plan> | null): Plan {
     ...Object.fromEntries(current.allocations.map((item) => [item.id, item.amount])),
     ...(raw?.expectedDefaults || {}),
   };
-  return { month, ...current, months, years, expectedDefaults };
+  return {
+    month,
+    ...current,
+    months,
+    years,
+    expectedDefaults,
+    merchantRules: raw?.merchantRules || [],
+    savingsTargets: {
+      minimum: raw?.savingsTargets?.minimum ?? initialPlan.savingsTargets.minimum,
+      ideal: raw?.savingsTargets?.ideal ?? initialPlan.savingsTargets.ideal,
+    },
+  };
 }
 
 function monthSnapshot(plan: MonthSnapshot): MonthSnapshot { return normalizeMonth(plan); }
@@ -183,26 +300,9 @@ function setExpectedOnSnapshot(raw: MonthSnapshot, id: string, amount: number): 
   const snapshot = monthSnapshot(raw);
   const target = snapshot.allocations.find((item) => item.id === id);
   if (!target) return snapshot;
-  const matchingBills = snapshot.bills.filter((bill) => bill.categoryId === id);
-  const matchingDebts = snapshot.debts.filter((debt) => debt.categoryId === id);
-  const bills = matchingBills.length === 1
-    ? snapshot.bills.map((bill) => bill.id === matchingBills[0].id ? { ...bill, amount: bill.frequency === "Annual" ? amount * 12 : amount } : bill)
-    : snapshot.bills;
-  const debts = matchingDebts.length === 1
-    ? snapshot.debts.map((debt) => {
-      if (debt.id !== matchingDebts[0].id) return debt;
-      return amount >= debt.minimum ? { ...debt, extra: amount - debt.minimum } : { ...debt, minimum: amount, extra: 0 };
-    })
-    : snapshot.debts;
   return {
     ...snapshot,
-    bills,
-    debts,
-    allocations: snapshot.allocations.map((item) => item.id === id ? {
-      ...item,
-      amount,
-      actual: usesAutomaticActual(item) && item.actualMode === "auto" ? amount : item.actual,
-    } : item),
+    allocations: snapshot.allocations.map((item) => item.id === id ? { ...item, amount } : item),
   };
 }
 
@@ -211,42 +311,102 @@ function nextMonthSnapshot(plan: MonthSnapshot, expectedDefaults: Record<string,
   for (const [id, amount] of Object.entries(expectedDefaults)) next = setExpectedOnSnapshot(next, id, amount);
   return {
     ...next,
-    allocations: next.allocations.map((item) => ({
-      ...item,
-      actual: usesAutomaticActual(item) ? item.amount : null,
-      actualMode: usesAutomaticActual(item) ? "auto" : "manual",
-    })),
+    incomes: next.incomes.map((item) => ({ ...item, amount: 0, expectedRemaining: item.amount + (item.expectedRemaining || 0) })),
+    allocations: next.allocations.map((item) => ({ ...item, actual: null, actualMode: "manual" })),
+    bills: next.bills.map((bill) => ({ ...bill, paid: false, paidAmount: undefined })),
     transactions: [],
   };
 }
 
-function summarizeMonth(plan: MonthSnapshot) {
-  const income = plan.incomes.reduce((sum, item) => sum + item.amount, 0);
+function billIsVisible(bill: Bill, monthKey: string) {
+  const month = Number(monthKey.slice(5, 7));
+  return bill.frequency === "Monthly" || bill.dueMonth === month;
+}
+
+function reconcileBillTransactions(snapshot: MonthSnapshot, monthKey: string): MonthSnapshot {
+  let transactions = snapshot.transactions.map((transaction) => ({ ...transaction }));
+  const transactionIds = new Set(transactions.map((transaction) => transaction.id));
+  let bills = snapshot.bills.map((bill) => bill.matchedTransactionId && !transactionIds.has(bill.matchedTransactionId)
+    ? { ...bill, paid: false, paidAmount: undefined, matchedTransactionId: undefined }
+    : { ...bill });
+  const linkedIds = new Set(bills.map((bill) => bill.matchedTransactionId).filter(Boolean));
+  transactions = transactions.map((transaction) => transaction.billId && !bills.some((bill) => bill.id === transaction.billId)
+    ? { ...transaction, billId: undefined }
+    : transaction);
+
+  bills = bills.map((bill) => {
+    if (!billIsVisible(bill, monthKey) || bill.matchedTransactionId) return bill;
+    const billName = normalizeMerchant(bill.name);
+    const candidates = transactions.filter((transaction) => {
+      if (transaction.billId || linkedIds.has(transaction.id) || transaction.date.slice(0, 7) !== monthKey) return false;
+      if (canonicalSpendingCategory(transaction.categoryId) !== canonicalSpendingCategory(bill.categoryId)) return false;
+      if (Math.abs(transaction.amount - bill.amount) > 0.01) return false;
+      const day = Number(transaction.date.slice(8, 10));
+      const nameMatch = normalizeMerchant(transaction.description).includes(billName) || billName.includes(normalizeMerchant(transaction.description));
+      return nameMatch || Math.abs(day - bill.dueDay) <= 5;
+    });
+    if (candidates.length !== 1) return bill;
+    const match = candidates[0];
+    linkedIds.add(match.id);
+    transactions = transactions.map((transaction) => transaction.id === match.id ? { ...transaction, billId: bill.id } : transaction);
+    return { ...bill, paid: true, paidAmount: match.amount, matchedTransactionId: match.id };
+  });
+  return { ...snapshot, bills, transactions };
+}
+
+function allocationSpendingCategory(item: Allocation) {
+  if (spendingCategoryIds.has(item.id)) return item.id;
+  if (legacyAllocationMap[item.id]) return legacyAllocationMap[item.id];
+  if (item.linked === "debt") return item.id === "car-payment" ? "car-transportation" : "bills";
+  if (item.id === "funded") return "other-uncategorized";
+  return null;
+}
+
+function summarizeMonth(plan: MonthSnapshot, monthKey: string) {
+  const incomeReceived = plan.incomes.reduce((sum, item) => sum + item.amount, 0);
+  const expectedIncome = plan.incomes.reduce((sum, item) => sum + (item.expectedRemaining || 0), 0);
+  const income = incomeReceived + expectedIncome;
   const allocated = plan.allocations.reduce((sum, item) => sum + item.amount, 0);
   const groups = plan.allocations.reduce<Record<string, number>>((all, item) => {
     all[item.group] = (all[item.group] || 0) + item.amount;
     return all;
   }, {});
-  const spentGroups = plan.allocations.reduce<Record<string, number>>((all, item) => {
-    all[item.group] = (all[item.group] || 0) + (item.actual ?? 0);
-    return all;
-  }, {});
-  const spent = plan.allocations.reduce((sum, item) => sum + (item.actual ?? 0), 0);
-  const protectedGroups = ["Giving", "Tax", "Home & bills", "Debt", "Goals", "Investing"];
-  const remainingProtected = protectedGroups.reduce(
-    (sum, group) => sum + Math.max(0, (groups[group] || 0) - (spentGroups[group] || 0)),
-    0,
-  );
+  const categoryActuals = Object.fromEntries(spendingCategories.map((category) => [category.id, 0])) as Record<string, number>;
+  const categoryTargets = Object.fromEntries(spendingCategories.map((category) => [category.id, 0])) as Record<string, number>;
+  plan.allocations.forEach((item) => {
+    const categoryId = allocationSpendingCategory(item);
+    if (!categoryId) return;
+    categoryTargets[categoryId] = (categoryTargets[categoryId] || 0) + item.amount;
+    categoryActuals[categoryId] = (categoryActuals[categoryId] || 0) + (item.actual ?? 0);
+  });
+  plan.transactions.forEach((transaction) => {
+    const categoryId = canonicalSpendingCategory(transaction.categoryId);
+    categoryActuals[categoryId] = (categoryActuals[categoryId] || 0) + transaction.amount;
+  });
+  const visibleBills = plan.bills.filter((bill) => billIsVisible(bill, monthKey));
+  visibleBills.filter((bill) => bill.paid && !bill.matchedTransactionId).forEach((bill) => {
+    const categoryId = canonicalSpendingCategory(bill.categoryId);
+    categoryActuals[categoryId] = (categoryActuals[categoryId] || 0) + (bill.paidAmount ?? bill.amount);
+  });
+  const spent = Object.values(categoryActuals).reduce((sum, amount) => sum + amount, 0);
+  const remainingBills = visibleBills
+    .filter((bill) => !bill.paid && bill.includedInProjection !== false)
+    .reduce((sum, bill) => sum + bill.amount, 0);
   const debt = plan.debts.reduce((sum, item) => sum + item.balance, 0);
   const assets = plan.assets.reduce((sum, item) => sum + item.balance, 0);
   return {
+    incomeReceived,
+    expectedIncome,
     income,
     allocated,
     available: income - allocated,
-    safeToSpend: income - spent - remainingProtected,
+    projectedBalance: income - spent - remainingBills,
+    remainingBills,
+    categoryActuals,
+    categoryTargets,
     groups,
-    spentGroups,
     spent,
+    reviewNeeded: plan.transactions.filter((transaction) => transaction.reviewNeeded).length,
     debt,
     assets,
     netWorth: assets - debt,
@@ -256,7 +416,7 @@ function freshPlan(): Plan { return normalizePlan(structuredClone(initialPlan));
 
 const navItems = [
   ["dashboard", "⌂", "Dashboard"],
-  ["budget", "▦", "Monthly budget"],
+  ["budget", "▦", "Monthly plan"],
   ["calendar", "□", "Bills & calendar"],
   ["debt", "↘", "Debt planner"],
   ["goals", "◎", "Savings goals"],
@@ -266,21 +426,11 @@ const navItems = [
   ["learn", "i", "Saving & help"],
 ] as const;
 
-const groupMeta: Record<string, { color: string; soft: string; icon: string }> = {
-  Giving: { color: "#ef7a32", soft: "#fff0e6", icon: "♡" },
-  Tax: { color: "#9b6ee0", soft: "#f1e9fb", icon: "%" },
-  "Home & bills": { color: "#3aa7df", soft: "#e4f4fb", icon: "⌂" },
-  Lifestyle: { color: "#d5be38", soft: "#f8f3d9", icon: "☕" },
-  Debt: { color: "#ed4f34", soft: "#fde8e3", icon: "↔" },
-  Goals: { color: "#39bf70", soft: "#e3f6ea", icon: "◎" },
-  Investing: { color: "#079e90", soft: "#def3ef", icon: "↗" },
-};
-
 const money = new Intl.NumberFormat("en-US", {
   style: "currency",
   currency: "USD",
   minimumFractionDigits: 0,
-  maximumFractionDigits: 0,
+  maximumFractionDigits: 2,
 });
 
 function CurrencyInput({
@@ -428,26 +578,32 @@ export default function Home() {
   const [plan, setPlan] = useState<Plan>(initialPlan);
   const [dashboardView, setDashboardView] = useState<"monthly" | "yearly">("monthly");
   const [dashboardYear, setDashboardYear] = useState(Number(initialPlan.month.slice(0, 4)));
-  const [selectedDashboardGroup, setSelectedDashboardGroup] = useState("Home & bills");
   const [ready, setReady] = useState(false);
   const [profiles, setProfiles] = useState<LocalProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [expectedEditorOpen, setExpectedEditorOpen] = useState(false);
   const [expectedScope, setExpectedScope] = useState<"month" | "future">("month");
   const [newProfileName, setNewProfileName] = useState("");
   const [backupPassword, setBackupPassword] = useState("");
   const [notice, setNotice] = useState("");
   const [storageAvailable, setStorageAvailable] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const statementInputRef = useRef<HTMLInputElement>(null);
   const planRef = useRef(plan);
+  const [transactionCategoryFilter, setTransactionCategoryFilter] = useState("all");
   const [transactionDraft, setTransactionDraft] = useState({
     date: "2026-08-01",
     description: "",
-    categoryId: "unexpected",
-    owner: "Jacobo",
+    categoryId: "other-uncategorized",
+    account: "Household",
     amount: 0,
   });
+  const [statementText, setStatementText] = useState("");
+  const [statementName, setStatementName] = useState("");
+  const [importMode, setImportMode] = useState<ImportAmountMode>("auto");
+  const [importAccount, setImportAccount] = useState("Checking");
+  const [importPreview, setImportPreview] = useState<ImportPreviewTransaction[]>([]);
+  const [importError, setImportError] = useState("");
   const [billDraft, setBillDraft] = useState({
     name: "",
     categoryId: "subscriptions",
@@ -483,6 +639,7 @@ export default function Home() {
           setActiveProfileId(selected.id);
           setPlan(nextPlan);
           setDashboardYear(Number(nextPlan.month.slice(0, 4)));
+          setTransactionDraft((current) => ({ ...current, date: `${nextPlan.month}-01` }));
           window.localStorage.setItem(ACTIVE_PROFILE_KEY, selected.id);
           // Persistence is a best-effort browser hint; IndexedDB saving still works without it.
           await requestPersistentStorage().catch(() => undefined);
@@ -516,12 +673,7 @@ export default function Home() {
 
   const activeProfile = profiles.find((profile) => profile.id === activeProfileId);
 
-  const totals = useMemo(() => summarizeMonth(plan), [plan]);
-  const visibleAllocations = useMemo(
-    () => plan.allocations.filter((item) => item.linked !== "debt" || plan.debts.some((debt) => debt.categoryId === item.id)),
-    [plan.allocations, plan.debts],
-  );
-
+  const totals = useMemo(() => summarizeMonth(plan, plan.month), [plan]);
   const savedMonths = useMemo(
     () => ({ ...plan.months, [plan.month]: monthSnapshot(plan) }),
     [plan],
@@ -533,38 +685,40 @@ export default function Home() {
     return {
       key,
       label: new Intl.DateTimeFormat("en-US", { month: "short" }).format(new Date(dashboardYear, index, 1)),
-      totals: snapshot ? summarizeMonth(snapshot) : summarizeMonth(normalizeMonth()),
+      totals: snapshot ? summarizeMonth(snapshot, key) : summarizeMonth(normalizeMonth(), key),
       hasData: Boolean(snapshot),
     };
   }), [dashboardYear, savedMonths]);
 
   const yearlyTotals = useMemo(() => {
     const activeMonths = yearlyMonths.filter((item) => item.hasData);
-    const groups = Object.fromEntries(Object.keys(groupMeta).map((group) => [
-      group,
-      activeMonths.reduce((sum, item) => sum + (item.totals.groups[group] || 0), 0),
+    const categoryActuals = Object.fromEntries(spendingCategories.map((category) => [
+      category.id,
+      activeMonths.reduce((sum, item) => sum + (item.totals.categoryActuals[category.id] || 0), 0),
     ]));
-    const spentGroups = Object.fromEntries(Object.keys(groupMeta).map((group) => [
-      group,
-      activeMonths.reduce((sum, item) => sum + (item.totals.spentGroups[group] || 0), 0),
+    const categoryTargets = Object.fromEntries(spendingCategories.map((category) => [
+      category.id,
+      activeMonths.reduce((sum, item) => sum + (item.totals.categoryTargets[category.id] || 0), 0),
     ]));
+    const incomeReceived = activeMonths.reduce((sum, item) => sum + item.totals.incomeReceived, 0);
+    const expectedIncome = activeMonths.reduce((sum, item) => sum + item.totals.expectedIncome, 0);
     const income = activeMonths.reduce((sum, item) => sum + item.totals.income, 0);
     const allocated = activeMonths.reduce((sum, item) => sum + item.totals.allocated, 0);
     const spent = activeMonths.reduce((sum, item) => sum + item.totals.spent, 0);
-    const protectedGroups = ["Giving", "Tax", "Home & bills", "Debt", "Goals", "Investing"];
-    const remainingProtected = protectedGroups.reduce(
-      (sum, group) => sum + Math.max(0, (groups[group] || 0) - (spentGroups[group] || 0)),
-      0,
-    );
+    const remainingBills = activeMonths.reduce((sum, item) => sum + item.totals.remainingBills, 0);
     const latest = [...activeMonths].reverse().find((item) => item.hasData)?.totals;
     return {
+      incomeReceived,
+      expectedIncome,
       income,
       allocated,
       available: income - allocated,
-      safeToSpend: income - spent - remainingProtected,
-      groups,
-      spentGroups,
+      projectedBalance: income - spent - remainingBills,
+      remainingBills,
+      categoryActuals,
+      categoryTargets,
       spent,
+      reviewNeeded: activeMonths.reduce((sum, item) => sum + item.totals.reviewNeeded, 0),
       debt: latest?.debt || 0,
       assets: latest?.assets || 0,
       netWorth: latest?.netWorth || 0,
@@ -588,28 +742,26 @@ export default function Home() {
     return [...Array(firstDay).fill(null), ...Array.from({ length: count }, (_, index) => index + 1)];
   }, [selectedMonth, selectedYear]);
   const monthlyBillTotal = plan.bills.reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
-  const subscriptionMonthly = plan.bills.filter((bill) => bill.categoryId === "subscriptions").reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
-  const visibleBills = plan.bills.filter((bill) => bill.frequency === "Monthly" || bill.dueMonth === selectedMonth);
+  const visibleBills = plan.bills.filter((bill) => billIsVisible(bill, plan.month));
   const debtMonthly = plan.debts.reduce((sum, debt) => sum + debt.minimum + debt.extra, 0);
   const bucketPercent = plan.investmentBuckets.reduce((sum, bucket) => sum + bucket.percent, 0);
 
-  const dashboardBudget = dashboardTotals.allocated || dashboardTotals.income;
   const dashboardPeriodLabel = dashboardView === "monthly" ? monthLabel : `${dashboardYear} YEAR`;
-  const dashboardCategories = Object.keys(groupMeta).map((group) => ({
-    group,
-    budget: dashboardTotals.groups[group] || 0,
-    spent: dashboardTotals.spentGroups[group] || 0,
+  const dashboardCategories = spendingCategories.map((category) => ({
+    ...category,
+    spent: dashboardTotals.categoryActuals[category.id] || 0,
+    target: dashboardTotals.categoryTargets[category.id] || 0,
   }));
-  const selectedDashboardCategory = dashboardCategories.find((item) => item.group === selectedDashboardGroup) ?? dashboardCategories[0];
-  const wheelWeightFloor = Math.max(dashboardCategories.reduce((sum, item) => sum + item.budget, 0) * 0.035, 1);
-  const wheelWeightTotal = dashboardCategories.reduce((sum, item) => sum + Math.max(item.budget, wheelWeightFloor), 0);
-  let wheelCursor = 0;
-  const wheelSegments = dashboardCategories.map((item) => {
-    const length = 350 * Math.max(item.budget, wheelWeightFloor) / wheelWeightTotal;
-    const segment = { ...item, offset: wheelCursor, length: Math.max(8, length - 4) };
-    wheelCursor += length;
-    return segment;
-  });
+  const targetMonths = dashboardView === "monthly" ? 1 : yearlyTotals.monthsWithData;
+  const minimumSavingsTarget = plan.savingsTargets.minimum * targetMonths;
+  const idealSavingsTarget = Math.max(plan.savingsTargets.minimum, plan.savingsTargets.ideal) * targetMonths;
+  const savingsTargetsConfigured = plan.savingsTargets.minimum > 0 || plan.savingsTargets.ideal > 0;
+  const projectedForSavings = Math.max(0, dashboardTotals.projectedBalance);
+  const savingsProgress = idealSavingsTarget ? Math.min(100, projectedForSavings / idealSavingsTarget * 100) : 0;
+  const reviewTransactions = plan.transactions.filter((transaction) => transaction.reviewNeeded);
+  const filteredTransactions = transactionCategoryFilter === "all"
+    ? plan.transactions
+    : plan.transactions.filter((transaction) => canonicalSpendingCategory(transaction.categoryId) === transactionCategoryFilter);
 
   function changeMonth(nextMonth: string) {
     if (!nextMonth || nextMonth === plan.month) return;
@@ -645,6 +797,13 @@ export default function Home() {
     }));
   }
 
+  function updateExpectedIncome(id: string, expectedRemaining: number) {
+    setPlan((current) => ({
+      ...current,
+      incomes: current.incomes.map((item) => (item.id === id ? { ...item, expectedRemaining } : item)),
+    }));
+  }
+
   function updateExpected(id: string, amount: number) {
     setPlan((current) => {
       const updated = setExpectedOnSnapshot(current, id, amount);
@@ -670,40 +829,51 @@ export default function Home() {
     }));
   }
 
-  function resetActualToExpected(id: string) {
-    setPlan((current) => ({
-      ...current,
-      allocations: current.allocations.map((item) => item.id === id ? { ...item, actual: item.amount, actualMode: "auto" } : item),
-    }));
-  }
-
   function updateBill(id: string, patch: Partial<Bill>) {
     setPlan((current) => {
       const applyToSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
         const snapshot = monthSnapshot(raw);
-        const previous = snapshot.bills.find((bill) => bill.id === id);
-        if (!previous) return snapshot;
-        const bills = snapshot.bills.map((bill) => (bill.id === id ? { ...bill, ...patch } : bill));
-        const affected = new Set([previous.categoryId, patch.categoryId].filter(Boolean));
-        return {
-          ...snapshot,
-          bills,
-          allocations: snapshot.allocations.map((item) => affected.has(item.id)
-            ? (() => {
-              const amount = bills.filter((bill) => bill.categoryId === item.id).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
-              return { ...item, amount, actual: item.actualMode === "auto" ? amount : item.actual };
-            })()
-            : item),
-        };
+        return { ...snapshot, bills: snapshot.bills.map((bill) => {
+          if (bill.id !== id) return bill;
+          const next = { ...bill, ...patch };
+          if (patch.amount !== undefined && bill.paid && (bill.paidAmount === undefined || bill.paidAmount === bill.amount)) next.paidAmount = patch.amount;
+          return next;
+        }) };
       };
       const updated = applyToSnapshot(current);
       return {
         ...current,
         ...updated,
         months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? applyToSnapshot(snapshot) : snapshot])),
-        expectedDefaults: { ...current.expectedDefaults, ...Object.fromEntries(updated.allocations.filter((item) => item.linked === "calendar").map((item) => [item.id, item.amount])) },
       };
     });
+  }
+
+  function updateBillForThisMonth(id: string, patch: Partial<Bill>) {
+    setPlan((current) => ({
+      ...current,
+      bills: current.bills.map((bill) => bill.id === id ? { ...bill, ...patch } : bill),
+    }));
+  }
+
+  function toggleBillPaid(id: string) {
+    const bill = plan.bills.find((item) => item.id === id);
+    if (!bill) return;
+    setPlan((current) => ({
+      ...current,
+      bills: current.bills.map((item) => item.id === id
+        ? item.paid
+          ? { ...item, paid: false, paidAmount: undefined, matchedTransactionId: undefined }
+          : { ...item, paid: true, paidAmount: item.amount }
+        : item),
+      transactions: current.transactions.map((transaction) => transaction.billId === id ? { ...transaction, billId: undefined } : transaction),
+    }));
+  }
+
+  function toggleBillProjection(id: string) {
+    const bill = plan.bills.find((item) => item.id === id);
+    if (!bill) return;
+    updateBillForThisMonth(id, { includedInProjection: bill.includedInProjection === false });
   }
 
   function addBill() {
@@ -718,23 +888,21 @@ export default function Home() {
       amount: billDraft.amount,
       dueDay: billDraft.dueDay,
       frequency: billDraft.frequency,
+      paid: false,
+      includedInProjection: true,
       ...(billDraft.frequency === "Annual" ? { dueMonth: selectedMonth } : {}),
     };
     setPlan((current) => {
       const addToSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
         const snapshot = monthSnapshot(raw);
         if (snapshot.bills.some((item) => item.id === bill.id)) return snapshot;
-        const bills = [...snapshot.bills, bill];
-        const categoryTotal = bills.filter((item) => item.categoryId === bill.categoryId).reduce((sum, item) => sum + (item.frequency === "Annual" ? item.amount / 12 : item.amount), 0);
-        return { ...snapshot, bills, allocations: snapshot.allocations.map((item) => item.id === bill.categoryId ? { ...item, amount: categoryTotal, actual: item.actualMode === "auto" ? categoryTotal : item.actual } : item) };
+        return { ...snapshot, bills: [...snapshot.bills, bill] };
       };
       const updated = addToSnapshot(current);
-      const categoryTotal = updated.allocations.find((item) => item.id === bill.categoryId)?.amount ?? 0;
       return {
         ...current,
         ...updated,
         months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? addToSnapshot(snapshot) : snapshot])),
-        expectedDefaults: { ...current.expectedDefaults, [bill.categoryId]: categoryTotal },
       };
     });
     setBillDraft({ name: "", categoryId: "subscriptions", amount: 0, dueDay: 1, frequency: "Monthly" });
@@ -747,17 +915,13 @@ export default function Home() {
       if (!removed) return current;
       const removeFromSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
         const snapshot = monthSnapshot(raw);
-        const bills = snapshot.bills.filter((bill) => bill.id !== id);
-        const categoryTotal = bills.filter((bill) => bill.categoryId === removed.categoryId).reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
-        return { ...snapshot, bills, allocations: snapshot.allocations.map((item) => item.id === removed.categoryId ? { ...item, amount: categoryTotal, actual: item.actualMode === "auto" ? categoryTotal : item.actual } : item) };
+        return { ...snapshot, bills: snapshot.bills.filter((bill) => bill.id !== id) };
       };
       const updated = removeFromSnapshot(current);
-      const categoryTotal = updated.allocations.find((item) => item.id === removed.categoryId)?.amount ?? 0;
       return {
         ...current,
         ...updated,
         months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? removeFromSnapshot(snapshot) : snapshot])),
-        expectedDefaults: { ...current.expectedDefaults, [removed.categoryId]: categoryTotal },
       };
     });
   }
@@ -769,7 +933,7 @@ export default function Home() {
         const linkedDebt = debts.find((debt) => debt.categoryId === item.id);
         if (!linkedDebt) return item;
         const amount = linkedDebt.minimum + linkedDebt.extra;
-        return { ...item, amount, actual: item.actualMode === "auto" ? amount : item.actual };
+        return { ...item, amount };
       });
       return {
         ...current,
@@ -786,7 +950,7 @@ export default function Home() {
     const categoryId = `debt-${crypto.randomUUID()}`;
     const debt: Debt = { id, categoryId, name: debtDraft.name.trim(), balance: debtDraft.balance, apr: debtDraft.apr, minimum: debtDraft.minimum, extra: debtDraft.extra };
     const amount = debt.minimum + debt.extra;
-    const allocation: Allocation = { id: categoryId, name: `${debt.name} payment`, group: "Debt", amount, actual: amount, actualMode: "auto", linked: "debt" };
+    const allocation: Allocation = { id: categoryId, name: `${debt.name} payment`, group: "Debt", amount, actual: null, actualMode: "manual", linked: "debt" };
     const addToSnapshot = (raw: MonthSnapshot): MonthSnapshot => {
       const snapshot = monthSnapshot(raw);
       return { ...snapshot, debts: [...snapshot.debts, debt], allocations: [...snapshot.allocations, allocation] };
@@ -811,7 +975,7 @@ export default function Home() {
         ...snapshot,
         debts: snapshot.debts.filter((item) => item.id !== id),
         allocations: seededCategory
-          ? snapshot.allocations.map((item) => item.id === debt.categoryId ? { ...item, amount: 0, actual: 0, actualMode: "auto" } : item)
+          ? snapshot.allocations.map((item) => item.id === debt.categoryId ? { ...item, amount: 0, actual: null, actualMode: "manual" } : item)
           : snapshot.allocations.filter((item) => item.id !== debt.categoryId),
       };
     };
@@ -826,7 +990,7 @@ export default function Home() {
         expectedDefaults,
       };
     });
-    setTransactionDraft((current) => current.categoryId === debt.categoryId ? { ...current, categoryId: "unexpected" } : current);
+    setTransactionDraft((current) => current.categoryId === debt.categoryId ? { ...current, categoryId: "other-uncategorized" } : current);
     setNotice(`${debt.name} was removed. Earlier months were preserved.`);
   }
 
@@ -849,24 +1013,173 @@ export default function Home() {
 
   function addTransaction() {
     if (!transactionDraft.description.trim() || transactionDraft.amount <= 0) return;
-    setPlan((current) => ({
-      ...current,
-      transactions: [{ ...transactionDraft, id: `transaction-${Date.now()}` }, ...current.transactions],
-      allocations: current.allocations.map((item) => item.id === transactionDraft.categoryId ? { ...item, actual: (item.actual ?? 0) + transactionDraft.amount, actualMode: "manual" } : item),
-    }));
+    const categoryId = transactionDraft.categoryId === "other-uncategorized"
+      ? categorizeMerchant(transactionDraft.description, plan.merchantRules)
+      : transactionDraft.categoryId;
+    const account = transactionDraft.account.trim() || "Household";
+    const transaction: Transaction = {
+      ...transactionDraft,
+      id: `transaction-${crypto.randomUUID()}`,
+      categoryId,
+      account,
+      source: "manual",
+      reviewNeeded: categoryId === "other-uncategorized",
+      fingerprint: transactionFingerprint(transactionDraft.date, transactionDraft.description, transactionDraft.amount, account),
+    };
+    setPlan((current) => {
+      const transactionMonth = transaction.date.slice(0, 7);
+      if (transactionMonth === current.month) return {
+        ...current,
+        ...reconcileBillTransactions({ ...monthSnapshot(current), transactions: [transaction, ...current.transactions] }, current.month),
+      };
+      const base = current.months[transactionMonth] || {
+        ...nextMonthSnapshot(current, current.expectedDefaults),
+        incomes: current.incomes.map((income) => ({ ...income, amount: 0, expectedRemaining: 0 })),
+      };
+      return {
+        ...current,
+        months: { ...current.months, [transactionMonth]: reconcileBillTransactions({ ...base, transactions: [transaction, ...base.transactions] }, transactionMonth) },
+        years: [...new Set([...current.years, Number(transactionMonth.slice(0, 4))])].sort((a, b) => a - b),
+      };
+    });
     setTransactionDraft((current) => ({ ...current, description: "", amount: 0 }));
   }
 
   function deleteTransaction(id: string) {
     setPlan((current) => {
-      const transaction = current.transactions.find((item) => item.id === id);
-      if (!transaction) return current;
       return {
         ...current,
         transactions: current.transactions.filter((item) => item.id !== id),
-        allocations: current.allocations.map((item) => item.id === transaction.categoryId ? { ...item, actual: Math.max(0, (item.actual ?? 0) - transaction.amount), actualMode: "manual" } : item),
+        bills: current.bills.map((bill) => bill.matchedTransactionId === id
+          ? { ...bill, paid: false, paidAmount: undefined, matchedTransactionId: undefined }
+          : bill),
       };
     });
+  }
+
+  function updateTransactionCategory(id: string, categoryId: string, remember = false, keepReview = false) {
+    const transaction = plan.transactions.find((item) => item.id === id);
+    if (!transaction) return;
+    const pattern = suggestedMerchantPattern(transaction.description);
+    const newRule: MerchantRule | null = remember && pattern
+      ? { id: `rule-${crypto.randomUUID()}`, pattern, categoryId }
+      : null;
+    const updateSnapshot = (raw: MonthSnapshot, monthKey: string): MonthSnapshot => {
+      const snapshot = monthSnapshot(raw);
+      return reconcileBillTransactions({
+        ...snapshot,
+        transactions: snapshot.transactions.map((item) => {
+          const shouldUpdate = item.id === id || (newRule && item.reviewNeeded && categorizeMerchant(item.description, [newRule]) === categoryId);
+          return shouldUpdate ? { ...item, categoryId, reviewNeeded: keepReview || categoryId === "other-uncategorized" } : item;
+        }),
+      }, monthKey);
+    };
+    setPlan((current) => ({
+      ...current,
+      ...updateSnapshot(current, current.month),
+      months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, updateSnapshot(snapshot, key)])),
+      merchantRules: newRule
+        ? [...current.merchantRules.filter((rule) => rule.pattern !== newRule.pattern), newRule]
+        : current.merchantRules,
+    }));
+    if (newRule) setNotice(`Future transactions containing “${pattern}” will use ${spendingCategories.find((item) => item.id === categoryId)?.name}.`);
+  }
+
+  function removeMerchantRule(id: string) {
+    setPlan((current) => ({ ...current, merchantRules: current.merchantRules.filter((rule) => rule.id !== id) }));
+  }
+
+  function existingFingerprints() {
+    const snapshots = [...Object.values(plan.months), monthSnapshot(plan)];
+    return new Set(snapshots.flatMap((snapshot) => snapshot.transactions.map((transaction) => transaction.fingerprint || transactionFingerprint(
+      transaction.date,
+      transaction.description,
+      transaction.amount,
+      transaction.account || transaction.owner || "Household",
+    ))));
+  }
+
+  function prepareStatement(text: string, mode: ImportAmountMode, account = importAccount) {
+    try {
+      const parsed = parseStatementCsv(text, mode);
+      const fingerprints = existingFingerprints();
+      const preview = parsed.transactions.map((transaction) => {
+        const categoryId = categorizeMerchant(transaction.description, plan.merchantRules);
+        const fingerprint = transactionFingerprint(transaction.date, transaction.description, transaction.amount, account);
+        const duplicate = fingerprints.has(fingerprint);
+        fingerprints.add(fingerprint);
+        return {
+          ...transaction,
+          id: crypto.randomUUID(),
+          categoryId,
+          reviewNeeded: categoryId === "other-uncategorized",
+          duplicate,
+        };
+      });
+      setImportPreview(preview);
+      setImportError("");
+      if (mode === "auto") setImportMode(parsed.detectedMode);
+    } catch (error) {
+      setImportPreview([]);
+      setImportError(error instanceof Error ? error.message : "That statement could not be read.");
+    }
+  }
+
+  async function handleStatementFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".csv")) {
+      setImportError("Download a CSV statement from your bank or card account. PDF statements are not supported in the private local importer.");
+      return;
+    }
+    const text = await file.text();
+    setStatementText(text);
+    setStatementName(file.name);
+    setImportMode("auto");
+    prepareStatement(text, "auto");
+  }
+
+  function importStatementTransactions() {
+    const readyTransactions = importPreview.filter((item) => !item.duplicate);
+    if (readyTransactions.length === 0) {
+      setNotice("No new transactions were found in that statement.");
+      return;
+    }
+    const account = importAccount.trim() || "Imported statement";
+    setPlan((current) => {
+      const snapshots: Record<string, MonthSnapshot> = { ...current.months, [current.month]: monthSnapshot(current) };
+      readyTransactions.forEach((item) => {
+        const key = item.date.slice(0, 7);
+        const base = snapshots[key] || {
+          ...nextMonthSnapshot(current, current.expectedDefaults),
+          incomes: current.incomes.map((income) => ({ ...income, amount: 0, expectedRemaining: 0 })),
+        };
+        const transaction: Transaction = {
+          id: `transaction-${item.id}`,
+          date: item.date,
+          description: item.description,
+          amount: item.amount,
+          categoryId: item.categoryId,
+          account,
+          source: "import",
+          reviewNeeded: item.reviewNeeded,
+          fingerprint: transactionFingerprint(item.date, item.description, item.amount, account),
+        };
+        snapshots[key] = { ...base, transactions: [transaction, ...base.transactions] };
+      });
+      [...new Set(readyTransactions.map((item) => item.date.slice(0, 7)))].forEach((key) => {
+        snapshots[key] = reconcileBillTransactions(snapshots[key], key);
+      });
+      const activeSnapshot = snapshots[current.month];
+      const years = [...new Set([...current.years, ...readyTransactions.map((item) => Number(item.date.slice(0, 4)))])].sort((a, b) => a - b);
+      return { ...current, ...activeSnapshot, months: snapshots, years };
+    });
+    const reviewCount = readyTransactions.filter((item) => item.reviewNeeded).length;
+    setImportPreview([]);
+    setStatementText("");
+    setStatementName("");
+    setNotice(`${readyTransactions.length} transactions imported${reviewCount ? `; ${reviewCount} need a category review` : " and categorized"}.`);
   }
 
   async function switchProfile(profileId: string) {
@@ -878,6 +1191,7 @@ export default function Home() {
       planRef.current = nextPlan;
       setPlan(nextPlan);
       setDashboardYear(Number(nextPlan.month.slice(0, 4)));
+      setTransactionDraft((current) => ({ ...current, date: `${nextPlan.month}-01` }));
       setActiveProfileId(profileId);
       window.localStorage.setItem(ACTIVE_PROFILE_KEY, profileId);
       setSettingsOpen(false);
@@ -901,6 +1215,7 @@ export default function Home() {
       setActiveProfileId(profile.id);
       setPlan(nextPlan);
       setDashboardYear(Number(nextPlan.month.slice(0, 4)));
+      setTransactionDraft((current) => ({ ...current, date: `${nextPlan.month}-01` }));
       setNewProfileName("");
       window.localStorage.setItem(ACTIVE_PROFILE_KEY, profile.id);
       setNotice(`${name} is ready with a separate, blank budget.`);
@@ -924,6 +1239,7 @@ export default function Home() {
         setActiveProfileId(replacement.id);
         setPlan(replacementPlan);
         setDashboardYear(Number(replacementPlan.month.slice(0, 4)));
+        setTransactionDraft((current) => ({ ...current, date: `${replacementPlan.month}-01` }));
         window.localStorage.setItem(ACTIVE_PROFILE_KEY, replacement.id);
       }
       setNotice(`${profile.name} was removed from this browser.`);
@@ -981,6 +1297,7 @@ export default function Home() {
       setActiveProfileId(profile.id);
       setPlan(restoredPlan);
       setDashboardYear(Number(restoredPlan.month.slice(0, 4)));
+      setTransactionDraft((current) => ({ ...current, date: `${restoredPlan.month}-01` }));
       window.localStorage.setItem(ACTIVE_PROFILE_KEY, profile.id);
       setSettingsOpen(false);
       setNotice(`${name} was restored as a new, separate workspace.`);
@@ -1044,7 +1361,7 @@ export default function Home() {
         <header className="topbar">
           <div>
             <p className="eyebrow">HOUSEHOLD PLAN</p>
-            <h1>{active === "dashboard" ? "Know what’s safe to spend." : navItems.find((item) => item[0] === active)?.[2]}</h1>
+            <h1>{active === "dashboard" ? "Spending and monthly balance." : navItems.find((item) => item[0] === active)?.[2]}</h1>
           </div>
           {active === "dashboard" && (
             <div className="period-controls">
@@ -1067,158 +1384,127 @@ export default function Home() {
 
         {active === "dashboard" && (
           <div className="dashboard">
-            <section className={dashboardTotals.safeToSpend < 0 ? "safe-spend-card danger" : "safe-spend-card"}>
-              <div className="safe-card-heading">
-                <div><p className="eyebrow">{dashboardPeriodLabel.toUpperCase()}</p><h2>Your most important number—at a glance.</h2></div>
-                <button onClick={() => setActive("budget")}>{dashboardView === "monthly" ? "Edit this month" : "Open monthly plan"} →</button>
+            <section className={dashboardTotals.projectedBalance < 0 ? "balance-card danger" : "balance-card"}>
+              <div className="balance-card-heading">
+                <div><p className="eyebrow">{dashboardPeriodLabel.toUpperCase()}</p><h2>{dashboardView === "monthly" ? "Projected monthly balance" : "Projected yearly balance"}</h2></div>
+                <button onClick={() => setActive("activity")}>Add or import spending →</button>
               </div>
-              <div className="spend-overview">
-                <div className="gauge-column">
-                  <div className="category-wheel">
-                    <svg viewBox="0 0 200 200" aria-label="Interactive budget category wheel">
-                      <circle className="wheel-track" cx="100" cy="100" r="74" pathLength="464" strokeDasharray="350 114" transform="rotate(135 100 100)" />
-                      {wheelSegments.map((segment) => (
-                        <circle
-                          aria-label={`${segment.group}: ${money.format(segment.spent)} spent of ${money.format(segment.budget)}`}
-                          className={selectedDashboardCategory.group === segment.group ? "wheel-segment selected" : "wheel-segment"}
-                          cx="100"
-                          cy="100"
-                          fill="none"
-                          key={segment.group}
-                          onClick={() => setSelectedDashboardGroup(segment.group)}
-                          onFocus={() => setSelectedDashboardGroup(segment.group)}
-                          onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedDashboardGroup(segment.group); }}
-                          onMouseEnter={() => setSelectedDashboardGroup(segment.group)}
-                          pathLength="464"
-                          r="74"
-                          role="button"
-                          stroke={groupMeta[segment.group].color}
-                          strokeDasharray={`${segment.length} ${464 - segment.length}`}
-                          strokeDashoffset={-segment.offset}
-                          tabIndex={0}
-                          transform="rotate(135 100 100)"
-                        ><title>{segment.group}</title></circle>
-                      ))}
-                    </svg>
-                    <div className="wheel-center" aria-live="polite">
-                      <span>Safe to spend</span>
-                      <strong>{money.format(dashboardTotals.safeToSpend)}</strong>
-                      <small>{money.format(dashboardTotals.spent)} spent of {money.format(dashboardBudget)} planned</small>
-                      <b style={{ color: groupMeta[selectedDashboardCategory.group].color }}>{groupMeta[selectedDashboardCategory.group].icon} {selectedDashboardCategory.group}</b>
-                    </div>
-                  </div>
-                  <div className="wheel-key">{dashboardCategories.map(({ group }) => <button className={selectedDashboardCategory.group === group ? "active" : ""} style={{ "--category-color": groupMeta[group].color } as CSSProperties} key={group} onClick={() => setSelectedDashboardGroup(group)}><span>{groupMeta[group].icon}</span>{group}</button>)}</div>
-                  <p>Every segment is live. Select one to highlight it; changing an Expected or Actual amount recalculates the wheel immediately.</p>
+              <div className="balance-card-body">
+                <div className="balance-result" aria-live="polite">
+                  <span>Expected at the end of {dashboardView === "monthly" ? "the month" : "the selected year"}</span>
+                  <strong>{money.format(dashboardTotals.projectedBalance)}</strong>
+                  <b>{dashboardTotals.projectedBalance >= 0 ? "Under income · money left over" : "Over income · overspent"}</b>
                 </div>
-                <div className="spending-categories">
-                  <div className="spending-head"><span>Spending categories</span><span>Spent</span><span>Budget</span></div>
-                  {dashboardCategories.map(({ group, budget, spent }) => {
-                    const progress = budget ? Math.min(100, spent / budget * 100) : 0;
-                    const rowClass = `${spent > budget && budget > 0 ? "spending-row over" : "spending-row"}${selectedDashboardCategory.group === group ? " selected" : ""}`;
-                    return <button className={rowClass} key={group} onClick={() => setSelectedDashboardGroup(group)} onMouseEnter={() => setSelectedDashboardGroup(group)}>
-                      <div className="spending-line"><span className="category-badge" style={{ color: groupMeta[group].color, background: groupMeta[group].soft }}>{groupMeta[group].icon}</span><strong>{group}</strong><b>{money.format(spent)}</b><span>/ {money.format(budget)}</span></div>
-                      <div className="category-track"><span style={{ width: `${progress}%`, background: groupMeta[group].color }} /></div>
-                    </button>;
-                  })}
+                <div className="balance-equation" aria-label="Projected balance calculation">
+                  <div><span>Total income</span><strong>{money.format(dashboardTotals.income)}</strong></div>
+                  <i>−</i>
+                  <div><span>Actual spending</span><strong>{money.format(dashboardTotals.spent)}</strong></div>
+                  <i>−</i>
+                  <div><span>Remaining bills</span><strong>{money.format(dashboardTotals.remainingBills)}</strong></div>
+                  <i>=</i>
+                  <div className="equation-total"><span>Projected balance</span><strong>{money.format(dashboardTotals.projectedBalance)}</strong></div>
                 </div>
               </div>
             </section>
 
-            <section className="stat-grid">
-              <article>
-                <span className="stat-icon income">↓</span>
-                <div><p>{dashboardView === "monthly" ? "Monthly income" : "Yearly income"}</p><strong>{money.format(dashboardTotals.income)}</strong></div>
-                <button onClick={() => setActive("budget")}>Open</button>
+            <section className="dashboard-summary-grid">
+              <article className="panel income-summary-card">
+                <div className="panel-heading"><div><p className="eyebrow">MONTHLY INCOME SUMMARY</p><h2>Money coming in</h2></div><button onClick={() => setActive("budget")}>Update</button></div>
+                <div className="three-line-summary"><span>Received</span><strong>{money.format(dashboardTotals.incomeReceived)}</strong><span>Expected remaining</span><strong>{money.format(dashboardTotals.expectedIncome)}</strong><span>Total monthly income</span><strong>{money.format(dashboardTotals.income)}</strong></div>
               </article>
-              <article>
-                <span className="stat-icon planned">▦</span>
-                <div><p>Planned outflow</p><strong>{money.format(dashboardTotals.allocated)}</strong></div>
-                <small>{dashboardTotals.income ? `${Math.min(100, dashboardTotals.allocated / dashboardTotals.income * 100).toFixed(0)}% of income` : "Not planned yet"}</small>
-              </article>
-              <article>
-                <span className="stat-icon invest">↗</span>
-                <div><p>{dashboardView === "monthly" ? "Investing this month" : "Investing this year"}</p><strong>{money.format(dashboardTotals.groups.Investing || 0)}</strong></div>
-                <button onClick={() => setActive("investing")}>Open</button>
-              </article>
-              <article>
-                <span className="stat-icon worth">◇</span>
-                <div><p>{dashboardView === "monthly" ? "Net worth" : "Latest net worth"}</p><strong>{money.format(dashboardTotals.netWorth)}</strong></div>
-                <button onClick={() => setActive("worth")}>Open</button>
+              <article className="panel savings-target-card">
+                <div className="panel-heading"><div><p className="eyebrow">SAVINGS TARGET</p><h2>{dashboardView === "monthly" ? "Protect monthly savings" : "Savings pace"}</h2></div><button onClick={() => setActive("budget")}>Edit</button></div>
+                <div className="target-amounts"><span>Minimum <b>{money.format(minimumSavingsTarget)}</b></span><span>Ideal <b>{money.format(idealSavingsTarget)}</b></span></div>
+                <div className="savings-track"><span style={{ width: `${savingsProgress}%` }} /></div>
+                <strong className={savingsTargetsConfigured && targetMonths > 0 && projectedForSavings >= minimumSavingsTarget ? "target-status on-track" : "target-status short"}>{targetMonths === 0 ? "Open a month to start the yearly view" : !savingsTargetsConfigured ? "Set your goals in Monthly Plan" : projectedForSavings >= idealSavingsTarget ? "Ideal goal covered" : projectedForSavings >= minimumSavingsTarget ? `${money.format(idealSavingsTarget - projectedForSavings)} from the ideal goal` : `${money.format(minimumSavingsTarget - projectedForSavings)} short of the minimum goal`}</strong>
               </article>
             </section>
 
-            {dashboardView === "yearly" ? (
-              <section className="panel year-overview">
-                <div className="panel-heading"><div><p className="eyebrow">JANUARY–DECEMBER</p><h2>{dashboardYear} month-by-month</h2></div><span className="live-pill">{yearlyTotals.monthsWithData} months saved</span></div>
-                <div className="year-month-grid">{yearlyMonths.map((item) => {
-                  const max = Math.max(item.totals.income, item.totals.allocated, item.totals.spent, 1);
-                  return <button className={item.key === plan.month ? "year-month-card active" : "year-month-card"} key={item.key} onClick={() => { changeMonth(item.key); setDashboardView("monthly"); }}>
-                    <div><strong>{item.label}</strong><span>{item.hasData ? money.format(item.totals.safeToSpend) : "Not started"}</span></div>
-                    <div className="year-bars"><i style={{ width: `${item.totals.income / max * 100}%` }} /><i style={{ width: `${item.totals.allocated / max * 100}%` }} /><i style={{ width: `${item.totals.spent / max * 100}%` }} /></div>
+            <div className="dashboard-main-grid">
+              <section className="panel actual-spending-card">
+                <div className="panel-heading"><div><p className="eyebrow">ACTUAL SPENDING SUMMARY</p><h2>{money.format(dashboardTotals.spent)} spent</h2></div><button onClick={() => setActive("activity")}>{dashboardTotals.reviewNeeded ? `${dashboardTotals.reviewNeeded} need review` : "View transactions"}</button></div>
+                <p className="section-note">Categories show what was actually spent. Monthly targets do not affect these totals.</p>
+                <div className="actual-category-grid">{dashboardCategories.map((category) => {
+                  const share = dashboardTotals.spent ? category.spent / dashboardTotals.spent * 100 : 0;
+                  return <button key={category.id} onClick={() => { setTransactionCategoryFilter(category.id); setActive("activity"); }}>
+                    <span className="actual-category-dot" style={{ background: category.color }} />
+                    <div><strong>{category.name}</strong><small>{share ? `${share.toFixed(0)}% of spending` : "No spending yet"}</small><i><b style={{ width: `${share}%`, background: category.color }} /></i></div>
+                    <b>{money.format(category.spent)}</b>
                   </button>;
                 })}</div>
-                <div className="year-legend"><span><i className="income" /> Income</span><span><i className="planned" /> Planned</span><span><i className="spent" /> Spent</span></div>
               </section>
-            ) : (
-              <div className="dashboard-grid">
-                <section className="panel month-details"><p className="eyebrow">THIS MONTH</p><h2>{monthLabel} snapshot</h2><div><span>Income</span><strong>{money.format(totals.income)}</strong><span>Spent</span><strong>{money.format(totals.spent)}</strong><span>Still unassigned</span><strong>{money.format(totals.available)}</strong></div></section>
-                <aside className="panel next-panel"><p className="eyebrow">NEXT BEST MOVE</p><h2>{totals.income ? (totals.safeToSpend < 0 ? "Bring spending back on track." : "Keep your plan current.") : "Start with your income."}</h2><p>{totals.income ? (totals.safeToSpend < 0 ? `You are ${money.format(Math.abs(totals.safeToSpend))} beyond what is currently safe to spend.` : `You can safely spend ${money.format(totals.safeToSpend)} after the rest of your plan is protected.`) : "Enter each paycheck once. The balance and every dashboard total will update instantly."}</p><button className="secondary-button" onClick={() => setActive("budget")}>{totals.income ? "Review monthly plan" : "Add income"} <span>→</span></button></aside>
-              </div>
-            )}
+
+              {dashboardView === "monthly" ? <section className="panel remaining-bills-card">
+                <div className="panel-heading"><div><p className="eyebrow">REMAINING BILLS THIS MONTH</p><h2>{money.format(totals.remainingBills)} left</h2></div><button onClick={() => setActive("calendar")}>Calendar</button></div>
+                <p className="section-note">Mark a bill paid to move it into actual spending. The projection will not count it twice.</p>
+                <div className="dashboard-bill-list">{visibleBills.filter((bill) => !bill.paid).sort((a, b) => a.dueDay - b.dueDay).map((bill) => <article key={bill.id}>
+                  <button className="bill-check" aria-label={`Mark ${bill.name} paid`} onClick={() => toggleBillPaid(bill.id)}>○</button>
+                  <div><strong>{bill.name}</strong><small>Due {new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(selectedYear, selectedMonth - 1, bill.dueDay))}</small></div>
+                  <b>{money.format(bill.amount)}</b>
+                  <button className={bill.includedInProjection === false ? "projection-toggle excluded" : "projection-toggle"} onClick={() => toggleBillProjection(bill.id)}>{bill.includedInProjection === false ? "Not included" : "Included"}</button>
+                </article>)}</div>
+                {visibleBills.filter((bill) => !bill.paid).length === 0 && <div className="compact-empty"><strong>All known bills are paid.</strong><span>Add another bill in the calendar if something is missing.</span></div>}
+              </section> : <section className="panel yearly-snapshot-card">
+                <p className="eyebrow">YEAR-TO-DATE</p><h2>{yearlyTotals.monthsWithData} months with data</h2>
+                <div className="three-line-summary"><span>Actual spending</span><strong>{money.format(yearlyTotals.spent)}</strong><span>Known bills remaining</span><strong>{money.format(yearlyTotals.remainingBills)}</strong><span>Projected balance</span><strong>{money.format(yearlyTotals.projectedBalance)}</strong></div>
+              </section>}
+            </div>
+
+            {dashboardView === "yearly" && <section className="panel year-overview">
+              <div className="panel-heading"><div><p className="eyebrow">JANUARY–DECEMBER</p><h2>{dashboardYear} month-by-month</h2></div><span className="live-pill">{yearlyTotals.monthsWithData} months saved</span></div>
+              <div className="year-month-grid">{yearlyMonths.map((item) => {
+                const max = Math.max(item.totals.income, item.totals.spent, item.totals.remainingBills, 1);
+                return <button className={item.key === plan.month ? "year-month-card active" : "year-month-card"} key={item.key} onClick={() => { changeMonth(item.key); setDashboardView("monthly"); }}>
+                  <div><strong>{item.label}</strong><span>{item.hasData ? money.format(item.totals.projectedBalance) : "Not started"}</span></div>
+                  <div className="year-bars"><i style={{ width: `${item.totals.income / max * 100}%` }} /><i style={{ width: `${item.totals.spent / max * 100}%` }} /><i style={{ width: `${item.totals.remainingBills / max * 100}%` }} /></div>
+                </button>;
+              })}</div>
+              <div className="year-legend"><span><i className="income" /> Income</span><span><i className="spent" /> Actual spending</span><span><i className="bills" /> Remaining bills</span></div>
+            </section>}
           </div>
         )}
 
         {active === "budget" && (
           <div className="budget-page">
             <section className="budget-summary">
-              <div><span>Income</span><strong>{money.format(totals.income)}</strong></div>
-              <div><span>Planned</span><strong>{money.format(totals.allocated)}</strong></div>
-              <div><span>Actual</span><strong>{money.format(totals.spent)}</strong></div>
-              <div className={totals.available < 0 ? "negative" : "positive"}><span>Unassigned</span><strong>{money.format(totals.available)}</strong></div>
+              <div><span>Total income</span><strong>{money.format(totals.income)}</strong></div>
+              <div><span>Optional targets</span><strong>{money.format(spendingCategories.reduce((sum, category) => sum + (totals.categoryTargets[category.id] || 0), 0))}</strong></div>
+              <div><span>Minimum savings</span><strong>{money.format(plan.savingsTargets.minimum)}</strong></div>
+              <div><span>Ideal savings</span><strong>{money.format(plan.savingsTargets.ideal)}</strong></div>
             </section>
 
             <div className="budget-columns">
               <section className="panel input-panel">
-                <div className="panel-heading"><div><p className="eyebrow">MONEY IN</p><h2>Income sources</h2></div><span className="live-pill">Live</span></div>
-                <p className="section-note">Change an earning and the dashboard balance updates immediately.</p>
-                <div className="input-list">
+                <div className="panel-heading"><div><p className="eyebrow">MONTHLY INCOME</p><h2>Income received and expected</h2></div><span className="live-pill">Updates balance</span></div>
+                <p className="section-note">Enter what has arrived and only the income still expected this month. Both feed the projected balance.</p>
+                <div className="income-plan-head"><span>Source</span><span>Received</span><span>Still expected</span></div>
+                <div className="income-plan-list">
                   {plan.incomes.map((item) => (
-                    <div className="input-row" key={item.id}>
+                    <div className="income-plan-row" key={item.id}>
                       <div><strong>{item.name}</strong><small>{item.owner}</small></div>
-                      <CurrencyInput value={item.amount} onChange={(amount) => updateIncome(item.id, amount)} ariaLabel={`${item.name} monthly income`} />
+                      <CurrencyInput value={item.amount} onChange={(amount) => updateIncome(item.id, amount)} ariaLabel={`${item.name} income received`} />
+                      <CurrencyInput value={item.expectedRemaining || 0} onChange={(amount) => updateExpectedIncome(item.id, amount)} ariaLabel={`${item.name} income expected remaining`} />
                     </div>
                   ))}
                 </div>
+                <section className="savings-goal-editor">
+                  <div><strong>Monthly savings goal</strong><small>Your projected balance is compared with both amounts.</small></div>
+                  <label><span>Minimum</span><CurrencyInput value={plan.savingsTargets.minimum} onChange={(minimum) => setPlan((current) => ({ ...current, savingsTargets: { ...current.savingsTargets, minimum } }))} ariaLabel="Minimum monthly savings target" /></label>
+                  <label><span>Ideal</span><CurrencyInput value={plan.savingsTargets.ideal} onChange={(ideal) => setPlan((current) => ({ ...current, savingsTargets: { ...current.savingsTargets, ideal } }))} ariaLabel="Ideal monthly savings target" /></label>
+                </section>
               </section>
 
               <section className="panel category-panel">
-                <div className="panel-heading"><div><p className="eyebrow">MONEY OUT</p><h2>Expected vs. actual</h2></div><div className="budget-panel-actions"><strong>{money.format(totals.spent)} actual</strong><button className={expectedEditorOpen ? "more-button active" : "more-button"} aria-label="Edit expected budget amounts" aria-expanded={expectedEditorOpen} onClick={() => setExpectedEditorOpen((open) => !open)}>{expectedEditorOpen ? "×" : "•••"}</button></div></div>
-                <p className="section-note">Fixed bills and debt payments start as already spent. Giving, Tax, and flexible categories stay blank until you enter an actual amount or add an optional transaction.</p>
-                {expectedEditorOpen && <section className="expected-editor" aria-label="Edit expected budget amounts">
-                  <div className="expected-editor-heading"><div><strong>Edit expected budget</strong><small>Choose where each change should apply.</small></div><div className="scope-toggle" role="group" aria-label="Expected budget change scope"><button className={expectedScope === "month" ? "active" : ""} onClick={() => setExpectedScope("month")}>This month only</button><button className={expectedScope === "future" ? "active" : ""} onClick={() => setExpectedScope("future")}>This & future months</button></div></div>
-                  <div className="expected-editor-list">{visibleAllocations.map((item) => <div className="expected-editor-row" key={item.id}><span><strong>{item.name}</strong><small>{item.group}</small></span><CurrencyInput value={item.amount} onChange={(amount) => updateExpected(item.id, amount)} ariaLabel={`${item.name} expected amount`} /></div>)}</div>
-                </section>}
-                <div className="budget-column-heads"><span>Category</span><span>Expected</span><span>Actual</span><span>Remaining</span></div>
-                {Object.keys(groupMeta).map((group) => (
-                  <div className="category-group" key={group}>
-                    <div className="category-title" style={{ background: groupMeta[group].soft }}>
-                      <span className="group-dot" style={{ background: groupMeta[group].color }} />
-                      <strong>{group}</strong>
-                      <span>{money.format(totals.groups[group] || 0)} planned</span>
-                      <span>{money.format(totals.spentGroups[group] || 0)} actual</span>
-                    </div>
-                    {visibleAllocations.filter((item) => item.group === group).map((item) => {
-                      const actual = item.actual ?? 0;
-                      const remaining = item.amount - actual;
-                      return <div className="category-row" key={item.id}>
-                        <span className="category-name"><strong>{item.name}</strong>{item.linked && <button className="linked-label" onClick={() => setActive(item.linked!)}>Open {item.linked === "calendar" ? "calendar" : item.linked} details →</button>}</span>
-                        <span className="planned-cell">{money.format(item.amount)}</span>
-                        <span className="actual-cell"><ActualCurrencyInput value={item.actual} onChange={(amount) => updateActual(item.id, amount)} ariaLabel={`${item.name} actual amount`} />{usesAutomaticActual(item) && <small>{item.actualMode === "auto" ? "Automatic" : <button onClick={() => resetActualToExpected(item.id)}>Use expected</button>}</small>}</span>
-                        <strong className={remaining < 0 ? "remaining-cell over" : "remaining-cell"}>{money.format(remaining)}</strong>
-                      </div>;
-                    })}
-                  </div>
-                ))}
+                <div className="panel-heading"><div><p className="eyebrow">OPTIONAL PLANNING</p><h2>Monthly targets</h2></div><div className="scope-toggle" role="group" aria-label="Monthly target change scope"><button className={expectedScope === "month" ? "active" : ""} onClick={() => setExpectedScope("month")}>This month only</button><button className={expectedScope === "future" ? "active" : ""} onClick={() => setExpectedScope("future")}>This & future months</button></div></div>
+                <p className="section-note">Targets live only here. They are optional and never change actual spending or the projected balance.</p>
+                <div className="target-list">{spendingCategories.map((category) => {
+                  const allocation = plan.allocations.find((item) => item.id === category.id);
+                  return <div className="target-row" key={category.id}>
+                    <span className="actual-category-dot" style={{ background: category.color }} />
+                    <div><strong>{category.name}</strong><small>Optional monthly target</small></div>
+                    <CurrencyInput value={allocation?.amount || 0} onChange={(amount) => updateExpected(category.id, amount)} ariaLabel={`${category.name} monthly target`} />
+                  </div>;
+                })}</div>
               </section>
             </div>
           </div>
@@ -1227,9 +1513,9 @@ export default function Home() {
         {active === "calendar" && (
           <div className="module-page">
             <section className="module-stats">
-              <article><span>Monthly bill plan</span><strong>{money.format(monthlyBillTotal)}</strong><small>Rolls into the budget</small></article>
-              <article><span>Subscriptions</span><strong>{money.format(subscriptionMonthly)}</strong><small>{plan.bills.filter((bill) => bill.categoryId === "subscriptions").length} items from your workbook</small></article>
-              <article><span>Due this month</span><strong>{visibleBills.length}</strong><small>{monthLabel}</small></article>
+              <article><span>Known monthly bills</span><strong>{money.format(monthlyBillTotal)}</strong><small>Recurring schedule</small></article>
+              <article><span>Remaining this month</span><strong>{money.format(totals.remainingBills)}</strong><small>Included in projection</small></article>
+              <article><span>Paid this month</span><strong>{visibleBills.filter((bill) => bill.paid).length}</strong><small>of {visibleBills.length} bills</small></article>
             </section>
             <div className="module-grid calendar-layout">
               <section className="panel calendar-panel">
@@ -1239,17 +1525,17 @@ export default function Home() {
                   {calendarDays.map((day, index) => {
                     const bills = day ? visibleBills.filter((bill) => bill.dueDay === day) : [];
                     return <div className={bills.length ? "calendar-day has-bill" : "calendar-day"} key={`${day}-${index}`}>
-                      {day && <><span className="day-number">{day}</span>{bills.slice(0, 3).map((bill) => <button key={bill.id} onClick={() => document.getElementById(bill.id)?.scrollIntoView({ behavior: "smooth", block: "center" })}>{bill.name}<small>{money.format(bill.amount)}</small></button>)}{bills.length > 3 && <small>+{bills.length - 3} more</small>}</>}
+                      {day && <><span className="day-number">{day}</span>{bills.slice(0, 3).map((bill) => <button className={bill.paid ? "paid" : ""} key={bill.id} onClick={() => document.getElementById(bill.id)?.scrollIntoView({ behavior: "smooth", block: "center" })}>{bill.paid ? "✓ " : ""}{bill.name}<small>{money.format(bill.paid ? bill.paidAmount ?? bill.amount : bill.amount)}</small></button>)}{bills.length > 3 && <small>+{bills.length - 3} more</small>}</>}
                     </div>;
                   })}
                 </div>
               </section>
               <section className="panel bill-list-panel">
                 <div className="panel-heading"><div><p className="eyebrow">RECURRING</p><h2>Bills & subscriptions</h2></div><span className="live-pill">Editable</span></div>
-                <p className="section-note">Add or change a recurring bill here for this and future months. Annual items appear in their selected month and contribute one-twelfth to the monthly plan.</p>
+                <p className="section-note">Recurring details continue into future months. Paid status and projection inclusion apply only to the selected month.</p>
                 <div className="recurring-form">
                   <label className="recurring-name"><span>Name</span><input value={billDraft.name} placeholder="New subscription" onChange={(event) => setBillDraft((current) => ({ ...current, name: event.target.value }))} /></label>
-                  <label><span>Category</span><select value={billDraft.categoryId} onChange={(event) => setBillDraft((current) => ({ ...current, categoryId: event.target.value }))}><option value="subscriptions">Subscriptions</option><option value="rent">Rent</option><option value="fpl">Electricity / FPL</option><option value="car-insurance">Car insurance</option></select></label>
+                  <label><span>Category</span><select value={billDraft.categoryId} onChange={(event) => setBillDraft((current) => ({ ...current, categoryId: event.target.value }))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label>
                   <label><span>Frequency</span><select value={billDraft.frequency} onChange={(event) => setBillDraft((current) => ({ ...current, frequency: event.target.value as Bill["frequency"] }))}><option value="Monthly">Monthly</option><option value="Annual">Annual</option></select></label>
                   <label className="compact-field"><span>Due</span><input aria-label="New recurring expense due day" type="number" min="1" max="28" value={billDraft.dueDay} onChange={(event) => setBillDraft((current) => ({ ...current, dueDay: Math.min(28, Math.max(1, Number(event.target.value) || 1)) }))} /></label>
                   <CurrencyInput value={billDraft.amount} onChange={(amount) => setBillDraft((current) => ({ ...current, amount }))} ariaLabel="New recurring expense amount" />
@@ -1257,9 +1543,11 @@ export default function Home() {
                 </div>
                 <div className="bill-list">
                   {plan.bills.map((bill) => <div className="bill-row" id={bill.id} key={bill.id}>
-                    <div><strong>{bill.name}</strong><small>{plan.allocations.find((item) => item.id === bill.categoryId)?.name} · {bill.frequency}</small></div>
+                    <button className={bill.paid ? "bill-status paid" : "bill-status"} onClick={() => toggleBillPaid(bill.id)}><span>{bill.paid ? "✓" : "○"}</span>{bill.paid ? "Paid" : "Unpaid"}</button>
+                    <div><strong>{bill.name}</strong><small>{spendingCategories.find((item) => item.id === canonicalSpendingCategory(bill.categoryId))?.name} · {bill.frequency}</small></div>
                     <label className="compact-field"><span>Due</span><input aria-label={`${bill.name} due day`} type="number" min="1" max="28" value={bill.dueDay} onChange={(event) => updateBill(bill.id, { dueDay: Math.min(28, Math.max(1, Number(event.target.value) || 1)) })} /></label>
                     <CurrencyInput value={bill.amount} onChange={(amount) => updateBill(bill.id, { amount })} ariaLabel={`${bill.name} amount`} />
+                    <button className={bill.includedInProjection === false ? "projection-toggle excluded" : "projection-toggle"} onClick={() => toggleBillProjection(bill.id)}>{bill.includedInProjection === false ? "Not included" : "In projection"}</button>
                     <button className="delete-bill-button" aria-label={`Delete ${bill.name}`} onClick={() => deleteBill(bill.id)}>×</button>
                   </div>)}
                 </div>
@@ -1363,27 +1651,76 @@ export default function Home() {
 
         {active === "activity" && (
           <div className="module-page">
+            <section className="statement-import-panel panel">
+              <div className="panel-heading"><div><p className="eyebrow">FASTEST WAY TO UPDATE SPENDING</p><h2>Import a bank or card statement</h2></div><span className="local-pill">Runs on this device</span></div>
+              <p className="section-note">Download a CSV from your bank, then upload it here. Paycheck detects spending, applies merchant rules, skips duplicates, matches clear bill payments, and flags only exceptions.</p>
+              <div className="statement-actions">
+                <button className="primary-button" onClick={() => statementInputRef.current?.click()}>Upload CSV statement</button>
+                <input ref={statementInputRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={handleStatementFile} />
+                <label><span>Account or payment method</span><input value={importAccount} placeholder="Checking or Visa" onChange={(event) => { setImportAccount(event.target.value); if (statementText) prepareStatement(statementText, importMode, event.target.value); }} /></label>
+                {statementText && <label><span>Charges appear as</span><select value={importMode} onChange={(event) => { const mode = event.target.value as ImportAmountMode; setImportMode(mode); prepareStatement(statementText, mode); }}><option value="negative">Negative amounts</option><option value="positive">Positive amounts</option></select></label>}
+              </div>
+              {importError && <p className="import-error">{importError}</p>}
+              {importPreview.length > 0 && <div className="import-preview">
+                <div className="import-preview-heading"><div><strong>{statementName}</strong><small>{importPreview.filter((item) => !item.duplicate).length} new · {importPreview.filter((item) => item.duplicate).length} duplicate · {importPreview.filter((item) => item.reviewNeeded && !item.duplicate).length} need review</small></div><button className="primary-button" onClick={importStatementTransactions}>Import new transactions</button></div>
+                <div className="import-preview-list">{importPreview.slice(0, 8).map((item) => <div className={item.duplicate ? "import-preview-row duplicate" : "import-preview-row"} key={item.id}>
+                  <span>{item.date}</span><strong>{item.description}</strong><b>{money.format(item.amount)}</b>
+                  <select aria-label={`Category for ${item.description}`} value={item.categoryId} disabled={item.duplicate} onChange={(event) => setImportPreview((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, categoryId: event.target.value, reviewNeeded: event.target.value === "other-uncategorized" } : candidate))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select>
+                  <small>{item.duplicate ? "Already imported" : item.reviewNeeded ? "Review needed" : "Ready"}</small>
+                </div>)}</div>
+                {importPreview.length > 8 && <small className="preview-more">+ {importPreview.length - 8} more transactions will follow the same rules.</small>}
+              </div>}
+            </section>
+
             <section className="transaction-entry panel">
-              <div className="panel-heading"><div><p className="eyebrow">OPTIONAL QUICK ENTRY</p><h2>Fun or unexpected purchase</h2></div><span className="live-pill">Optional</span></div>
-              <p className="section-note">You do not need to enter rent, insurance, subscriptions, or every purchase. Use this only when a one-off expense is useful to remember; it adds to that category’s Actual total.</p>
+              <div className="panel-heading"><div><p className="eyebrow">QUICK ENTRY</p><h2>Add one transaction</h2></div><span className="live-pill">Optional</span></div>
+              <p className="section-note">Only the essentials. Leave the category as Other and Paycheck will try the merchant rules when you add it.</p>
               <div className="transaction-form">
                 <label><span>Date</span><input type="date" value={transactionDraft.date} onChange={(event) => setTransactionDraft((current) => ({ ...current, date: event.target.value }))} /></label>
-                <label className="description-field"><span>Description</span><input placeholder="Merchant or note" value={transactionDraft.description} onChange={(event) => setTransactionDraft((current) => ({ ...current, description: event.target.value }))} /></label>
-                <label><span>Category</span><select value={transactionDraft.categoryId} onChange={(event) => setTransactionDraft((current) => ({ ...current, categoryId: event.target.value }))}>{visibleAllocations.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
-                <label><span>Who</span><select value={transactionDraft.owner} onChange={(event) => setTransactionDraft((current) => ({ ...current, owner: event.target.value }))}><option>Jacobo</option><option>Partner</option><option>Household</option></select></label>
+                <label className="description-field"><span>Description / merchant</span><input placeholder="Example: Publix" value={transactionDraft.description} onBlur={() => setTransactionDraft((current) => current.categoryId === "other-uncategorized" ? { ...current, categoryId: categorizeMerchant(current.description, plan.merchantRules) } : current)} onChange={(event) => setTransactionDraft((current) => ({ ...current, description: event.target.value }))} /></label>
+                <label><span>Category</span><select value={transactionDraft.categoryId} onChange={(event) => setTransactionDraft((current) => ({ ...current, categoryId: event.target.value }))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label>
+                <label><span>Account</span><input value={transactionDraft.account} placeholder="Checking" onChange={(event) => setTransactionDraft((current) => ({ ...current, account: event.target.value }))} /></label>
                 <label><span>Amount</span><CurrencyInput value={transactionDraft.amount} onChange={(amount) => setTransactionDraft((current) => ({ ...current, amount }))} ariaLabel="Transaction amount" /></label>
                 <button className="primary-button" onClick={addTransaction}>Add transaction</button>
               </div>
             </section>
             <section className="module-stats transaction-stats">
-              <article><span>Actual spending</span><strong>{money.format(totals.spent)}</strong><small>Includes automatic fixed expenses</small></article>
-              <article><span>Planned spending</span><strong>{money.format(totals.allocated)}</strong><small>Includes saving and investing</small></article>
-              <article><span>Optional entries</span><strong>{plan.transactions.length}</strong><small>Fun and unexpected purchases</small></article>
+              <article><span>Actual spending</span><strong>{money.format(totals.spent)}</strong><small>Transactions and paid bills</small></article>
+              <article><span>Transactions</span><strong>{plan.transactions.length}</strong><small>{monthLabel}</small></article>
+              <article><span>Review needed</span><strong>{reviewTransactions.length}</strong><small>Unrecognized merchants</small></article>
             </section>
+
+            {reviewTransactions.length > 0 && <section className="panel review-panel">
+              <div className="panel-heading"><div><p className="eyebrow">EXCEPTIONS ONLY</p><h2>Review needed</h2></div><span className="review-count">{reviewTransactions.length}</span></div>
+              <p className="section-note">Choose a category once. “Categorize & remember” creates a local merchant rule for similar transactions.</p>
+              <div className="review-list">{reviewTransactions.map((transaction) => <div className="review-row" key={transaction.id}>
+                <div><strong>{transaction.description}</strong><small>{transaction.date} · {transaction.account || transaction.owner || "Household"}</small></div>
+                <b>{money.format(transaction.amount)}</b>
+                <select value={transaction.categoryId} onChange={(event) => updateTransactionCategory(transaction.id, event.target.value, false, true)}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select>
+                <div className="review-actions"><button disabled={transaction.categoryId === "other-uncategorized"} onClick={() => updateTransactionCategory(transaction.id, transaction.categoryId)}>Done</button><button disabled={transaction.categoryId === "other-uncategorized"} onClick={() => updateTransactionCategory(transaction.id, transaction.categoryId, true)}>Remember</button></div>
+              </div>)}</div>
+            </section>}
+
             <section className="panel transaction-panel">
-              <div className="panel-heading"><div><p className="eyebrow">ACTIVITY</p><h2>Household transactions</h2></div></div>
-              {plan.transactions.length === 0 ? <div className="empty-state"><span>≡</span><h3>No optional transactions</h3><p>That is okay—fixed expenses and direct Actual amounts already update the dashboard.</p></div> : <div className="transaction-table"><div className="transaction-head"><span>Date</span><span>Description</span><span>Category</span><span>Owner</span><span>Amount</span><span /></div>{plan.transactions.map((transaction) => <div className="transaction-row" key={transaction.id}><span>{transaction.date}</span><strong>{transaction.description}</strong><span>{plan.allocations.find((item) => item.id === transaction.categoryId)?.name}</span><span>{transaction.owner}</span><strong>{money.format(transaction.amount)}</strong><button aria-label={`Delete ${transaction.description}`} onClick={() => deleteTransaction(transaction.id)}>×</button></div>)}</div>}
+              <div className="panel-heading"><div><p className="eyebrow">ACTIVITY</p><h2>Transactions</h2></div><label className="transaction-filter"><span>Show</span><select value={transactionCategoryFilter} onChange={(event) => setTransactionCategoryFilter(event.target.value)}><option value="all">All categories</option>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label></div>
+              {filteredTransactions.length === 0 ? <div className="empty-state"><span>≡</span><h3>No transactions here yet</h3><p>Upload a CSV statement or add a single transaction above.</p></div> : <div className="transaction-table"><div className="transaction-head"><span>Date</span><span>Description</span><span>Category</span><span>Account</span><span>Amount</span><span /></div>{filteredTransactions.map((transaction) => <div className="transaction-row" key={transaction.id}><span>{transaction.date}</span><strong>{transaction.description}</strong><span>{spendingCategories.find((item) => item.id === canonicalSpendingCategory(transaction.categoryId))?.name}</span><span>{transaction.account || transaction.owner || "Household"}</span><strong>{money.format(transaction.amount)}</strong><button aria-label={`Delete ${transaction.description}`} onClick={() => deleteTransaction(transaction.id)}>×</button></div>)}</div>}
             </section>
+
+            <details className="panel manual-totals-panel">
+              <summary>Enter an unitemized category total</summary>
+              <p>If you do not want to list transactions, enter only the extra total for a category here. Paid bills and imported transactions are added separately.</p>
+              <div>{spendingCategories.map((category) => {
+                const allocation = plan.allocations.find((item) => item.id === category.id);
+                return <label key={category.id}><span>{category.name}</span><ActualCurrencyInput value={allocation?.actual} onChange={(amount) => updateActual(category.id, amount)} ariaLabel={`${category.name} unitemized actual amount`} /></label>;
+              })}</div>
+            </details>
+
+            <details className="panel merchant-rules-panel">
+              <summary>Merchant rules</summary>
+              <p>Built-in examples include Publix and Aldi → Groceries; Shell and Exxon → Gas; Chick-fil-A and Taco Bell → Fast Food; Netflix, Spotify, and Apple → Subscriptions.</p>
+              <div className="rule-list">{plan.merchantRules.length === 0 ? <small>No custom rules yet. Create one from Review Needed.</small> : plan.merchantRules.map((rule) => <span key={rule.id}><b>{rule.pattern}</b> → {spendingCategories.find((item) => item.id === rule.categoryId)?.name}<button aria-label={`Delete rule ${rule.pattern}`} onClick={() => removeMerchantRule(rule.id)}>×</button></span>)}</div>
+              <small>{defaultMerchantRules.length} built-in rules run locally. No financial data is sent to an AI service.</small>
+            </details>
           </div>
         )}
 
@@ -1415,13 +1752,13 @@ export default function Home() {
             <section className="panel architecture-panel">
               <div className="panel-heading"><div><p className="eyebrow">HOW IT WORKS</p><h2>Three things to remember</h2></div><span className="live-pill">Auto-save on</span></div>
               <div className="data-flow" aria-label="How changes are calculated and saved">
-                <article><span>1</span><strong>Enter or change an amount</strong><small>Add income, bills, debt, savings, or investing.</small></article><b>→</b>
-                <article><span>2</span><strong>Your dashboard updates</strong><small>Connected balances and totals recalculate together.</small></article><b>→</b>
-                <article><span>3</span><strong>Your device saves it</strong><small>Return with the same browser and device to continue.</small></article>
+                <article><span>1</span><strong>Update income and known bills</strong><small>Mark each bill paid when it clears.</small></article><b>→</b>
+                <article><span>2</span><strong>Upload spending or add one item</strong><small>Merchant rules categorize the familiar purchases.</small></article><b>→</b>
+                <article><span>3</span><strong>Check the projected balance</strong><small>The dashboard recalculates and saves on this device.</small></article>
               </div>
             </section>
             <div className="learn-grid">
-              <section className="panel explainer-card"><span className="explainer-icon">✓</span><p className="eyebrow">EVERYDAY USE</p><h2>Saving is automatic</h2><p>You do not need to download a new file after every change. Paycheck saves entries in this browser on this device.</p></section>
+              <section className="panel explainer-card"><span className="explainer-icon">≡</span><p className="eyebrow">FAST ENTRY</p><h2>Import a statement</h2><p>Upload a bank or card CSV. Categorization rules run on this device, duplicates are skipped, and only unknown merchants need review.</p><button onClick={() => setActive("activity")}>Open transactions →</button></section>
               <section className="panel explainer-card"><span className="explainer-icon">⌂</span><p className="eyebrow">INSTALLABLE WEBSITE</p><h2>It is not a Chrome extension</h2><p>Paycheck is a Progressive Web App. You can use it as a website or install it from Chrome or Edge so it opens in its own app window.</p></section>
               <section className="panel explainer-card"><span className="explainer-icon">↓</span><p className="eyebrow">BACKUP FILE</p><h2>What is a `.paycheck` file?</h2><p>It is a backup made for this app. If Word shows code when you open it, nothing is wrong—return here and choose “Restore a backup.”</p><button onClick={() => setSettingsOpen(true)}>Download or restore →</button></section>
             </div>

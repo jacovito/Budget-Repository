@@ -2,27 +2,38 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import test from "node:test";
 
-test("includes editable recurring expenses and separated categories", async () => {
+test("includes editable recurring expenses and separated actual-spending categories", async () => {
   const source = await fs.readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(source, /New subscription/);
   assert.match(source, /function addBill\(/);
   assert.match(source, /function deleteBill\(/);
-  assert.match(source, /group: "Giving"/);
-  assert.match(source, /group: "Tax"/);
-  assert.match(source, /name: "Miscellaneous"/);
-  assert.match(source, /name: "Unexpected"/);
-  assert.doesNotMatch(source, /disabled=\{Boolean\(item\.linked\)\}/);
+  assert.match(source, /name: "Groceries"/);
+  assert.match(source, /name: "Gas"/);
+  assert.match(source, /name: "Fast Food"/);
+  assert.match(source, /name: "Restaurants"/);
+  assert.match(source, /name: "Other \/ Uncategorized"/);
 });
 
-test("uses expected and actual totals without requiring transactions", async () => {
+test("projects the month from income, actual spending, and unpaid bills", async () => {
   const source = await fs.readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(source, /function usesAutomaticActual\(/);
-  assert.match(source, /item\.linked === "calendar" \|\| item\.linked === "debt"/);
-  assert.match(source, /Expected vs\. actual/);
+  assert.match(source, /projectedBalance: income - spent - remainingBills/);
+  assert.match(source, /function toggleBillPaid\(/);
+  assert.match(source, /includedInProjection/);
+  assert.match(source, /Projected monthly balance/);
+  assert.doesNotMatch(source, /Safe to spend/i);
+});
+
+test("keeps targets secondary and supports low-effort transaction imports", async () => {
+  const source = await fs.readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(source, /Monthly targets/);
   assert.match(source, /This month only/);
   assert.match(source, /This & future months/);
-  assert.match(source, /transactions: \[\{ \.\.\.transactionDraft/);
-  assert.match(source, /actual: \(item\.actual \?\? 0\) \+ transactionDraft\.amount/);
+  assert.match(source, /Upload CSV statement/);
+  assert.match(source, /function importStatementTransactions\(/);
+  assert.match(source, /Review needed/);
+  assert.match(source, /merchantRules/);
+  assert.match(source, /minimum: 0, ideal: 0/);
+  assert.match(source, /Set your goals in Monthly Plan/);
 });
 
 test("supports adding and archiving liabilities while preserving past months", async () => {

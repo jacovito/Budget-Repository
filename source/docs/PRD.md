@@ -1,13 +1,13 @@
 # Paycheck Budget Planner — Product Requirements Document
 
 **Status:** Version 1.0 deployment plan  
-**Primary audience:** Jacobo and partner initially; later, any person or household using an independent local budget  
+**Primary audience:** Any person or household using an independent local budget
 **Distribution:** Public installable web app plus downloadable local package  
 **Data model:** Local-first; no shared financial database in version 1
 
 ## 1. Product summary
 
-Paycheck is an interactive household budgeting application connecting monthly income, planned spending, bills, debt, savings goals, investing, transactions, and net worth. When a user changes an earning or linked financial amount, every affected dashboard total updates immediately.
+Paycheck is an actual-spending-first household budgeting application connecting monthly income, transactions, remaining bills, optional targets, debt, savings goals, investing, and net worth. When a user changes income, imports spending, or marks a bill paid, every affected dashboard total updates immediately.
 
 The product must work without an OpenAI account and without sending financial information to a collective server. Each browser or locally installed copy stores its own information independently. Users can move a budget by exporting and restoring a `.paycheck` backup.
 
@@ -29,7 +29,7 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 ## 4. Version 1 non-goals
 
 - No shared financial database.
-- No bank connection or automatic transaction importing.
+- No live bank connection or credential storage.
 - No mandatory account or subscription.
 - No real-time collaboration between devices.
 - No storage of backup encryption passwords.
@@ -43,19 +43,21 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 
 ## 6. Functional requirements
 
-### Dashboard and budget
+### Dashboard and monthly plan
 
-- Display income, assigned money, available money, investing, debt, and net worth.
+- Display income received, income still expected, actual spending, remaining bills, and projected monthly balance.
+- Calculate `income - actual spending - remaining bills = projected balance`.
+- Label a positive balance as under income/money left over and a negative balance as over income/overspent.
 - Recalculate immediately after related changes.
-- Warn when allocations exceed income.
 - Support multiple income sources and ownership labels.
-- Organize allocations into giving/tax, home/bills, lifestyle, debt, goals, and investing.
+- Keep optional category targets in one Monthly Plan area rather than throughout the dashboard.
+- Compare the projection with editable minimum and ideal monthly savings targets.
 
 ### Bills and calendar
 
 - Display monthly and annual recurring expenses.
-- Convert annual expenses into monthly planning amounts.
-- Update connected budget categories.
+- Track paid/unpaid status and whether each unpaid bill is included in the projection.
+- Move paid bills into actual spending without double-counting them.
 
 ### Debt, savings, and investing
 
@@ -66,10 +68,12 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 - Allocate one monthly investing resource among configurable percentage buckets.
 - Reflect investing on the dashboard and budget.
 
-### Transactions and net worth
+### Transactions, imports, and net worth
 
-- Record transaction date, description, category, owner, and amount.
-- Compare recorded with planned spending.
+- Record transaction date, description, amount, category, and account/payment method.
+- Import common bank and credit-card CSV exports locally.
+- Apply built-in and user-created merchant rules, prevent duplicates, and collect unmatched items in Review Needed.
+- Keep Groceries, Gas, Fast Food, Restaurants, Bills, Subscriptions, Car / Transportation, Personal, Shopping, Other / Uncategorized, Giving, and Tax separate.
 - Track cash, savings, business, crypto, investment, and property assets.
 - Subtract debt balances controlled by the debt planner.
 
