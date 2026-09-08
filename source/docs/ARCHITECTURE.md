@@ -4,7 +4,7 @@ Paycheck is a **local-first progressive web app (PWA)**. The hosted website cont
 
 ## Current design
 
-1. React renders the interface and calculates every view from one connected `Plan`, so an income, bill, debt, goal, or investment change immediately updates the dashboard.
+1. React renders the interface from one connected `Plan`. Pure functions in `app/budget-model.ts` derive income, actual spending, and remaining bills; planning values do not create actual spending.
 2. IndexedDB stores independent profiles and plans. `localStorage` holds only the last-opened profile ID; an older `paycheck-plan-v1` record is migrated once and removed only after the new write succeeds.
 3. A web manifest makes the site installable, while the service worker caches the application shell for offline reopening.
 4. A portable `.paycheck` file acts like an Excel save file. Restore is non-destructive and creates a new workspace.
@@ -20,16 +20,16 @@ Local profiles organize records on one browser; they are not password-protected 
 - Marking a bill paid removes it from remaining bills and adds its paid amount to actual spending, so the projection is unchanged unless the paid amount changes.
 - Category targets are optional, live only in Monthly Plan, and never feed the main balance calculation.
 - Giving and Tax remain separate actual-spending categories.
-- Calendar supports monthly and annual recurring expenses. Annual expenses contribute one-twelfth of their amount to the monthly plan and remain identified by their selected due month.
+- Calendar supports monthly and annual recurring expenses. The full annual charge belongs to its due month. Date display clamps due days to the last day of shorter months.
 - Debt minimum and extra payments update linked debt allocations.
 - Goal contributions update Savings.
 - Monthly investing updates Stocks & investing.
 - Assets minus connected debt produce net worth.
 - Yearly totals aggregate only months that have been opened and saved in the selected year; the latest saved month supplies the year-end net-worth snapshot.
 
-The dashboard category list is derived from the same transactions, bill statuses, and direct totals. Selecting a category opens the filtered transaction ledger.
+The dashboard category list is derived from the same transactions, bill statuses, and direct totals. Selecting a ring segment or category row opens a detail panel containing transactions, paid unlinked bills, and direct totals; those entries sum to the category amount.
 
-Target defaults are stored separately from month snapshots. A “This month only” edit stays in its snapshot; a “This & future months” edit updates the default and any already-saved future snapshots. New months reset actual spending and bill-paid statuses while carrying known bills forward.
+Target defaults are stored separately from month snapshots. A “This month only” edit stays in its snapshot; a “This & future months” edit updates the default and any already-saved future snapshots. New months reset actual spending, bill-paid statuses, and transaction matching links while carrying known bills forward.
 
 CSV statement parsing runs entirely in the browser. The importer recognizes common date, merchant, amount, and debit headings; the user can switch whether expenses are negative or positive. A stable date/merchant/amount/account fingerprint prevents duplicate imports. Built-in keyword rules and user-created rules handle categorization, and unmatched transactions are marked for review.
 
@@ -38,6 +38,14 @@ Adding or archiving a liability transforms only the active and future snapshots.
 Money inputs pass through `app/math-expression.ts`. Its small arithmetic parser supports decimal numbers, currency separators, parentheses, and `+`, `-`, `*`, `/`; it does not execute JavaScript or arbitrary formulas.
 
 Do not create duplicate totals that users must synchronize manually. Add a field once, then derive every view that consumes it.
+
+## Interaction layer
+
+- `app/interface.tsx` supplies functional SVG icons, an actual-spending ring, native checkboxes, and native HTML dialogs with focus trapping and Escape dismissal.
+- `app/interface.css` provides the desktop workspace, four-tab mobile navigation, bottom sheets, ledger cards, and shared accessible controls.
+- Bill payment updates are pure state transformations; a manual checkbox action offers a scoped undo. A payment matched to an existing transaction cannot be unchecked into duplicate spending.
+- A month-only amount adjustment updates both the amount and a manually paid amount, preserving other snapshots. Recurring changes use the explicit future scope.
+- Imports remain local. The file chooser and drag/drop use the same CSV parser, with a preview before mutation. The full preview stays scrollable on desktop and flows on phones.
 
 ## Backup security
 

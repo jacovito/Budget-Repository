@@ -1,8 +1,17 @@
 # Paycheck Budget Planner
 
-Paycheck is a local-first household budgeting Progressive Web App (PWA). It connects income, monthly budgets, bills, debt, savings goals, investing, transactions, net worth, and monthly/yearly dashboards without sending financial records to a shared application database.
+Paycheck is a local-first household budgeting Progressive Web App (PWA). It leads with actual spending, unpaid bills, and the projected monthly balance. Optional planning tools remain available without sending financial records to a shared application database.
 
 It is **not a Chrome extension**. It is a website that can also be installed from Chrome or Edge and opened in its own app window. The same application can be run from the downloadable local ZIP.
+
+## Current experience
+
+- Desktop overview with a clear balance calculation, actual-spending ring, and bill checklist.
+- Phone navigation uses Overview, Spending, Bills, and More; entry opens in a compact sheet.
+- Check bills paid with Undo. Edit a bill amount or due date for this month only or future months too.
+- Tap a category to see the transactions, paid bills, and direct totals behind it.
+- Import a CSV through file selection or desktop drag/drop; search and review exceptions in Spending.
+- These requirements intentionally replace v1's planned-spending emphasis. See the [product direction change](docs/PRD.md) and [interaction research](docs/UX-RESEARCH.md).
 
 ## Data model
 
@@ -43,7 +52,7 @@ npm test
 npm run build
 ```
 
-The main product code is in `app/page.tsx`, `app/globals.css`, `app/local-store.ts`, `app/math-expression.ts`, and `app/backup.ts`. PWA files live in `public/`. Tests live in `tests/`.
+The main product code is in `app/page.tsx`, `app/budget-model.ts`, `app/interface.tsx`, `app/interface.css`, `app/globals.css`, `app/local-store.ts`, `app/math-expression.ts`, and `app/backup.ts`. PWA files live in `public/`. Tests live in `tests/`.
 
 ## Build and deployment
 

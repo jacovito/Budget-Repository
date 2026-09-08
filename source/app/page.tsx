@@ -4,426 +4,36 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEv
 import { backupNeedsPassword, createBackup, readBackup } from "./backup";
 import { deleteProfile, listProfiles, loadPlan, putProfile, requestPersistentStorage, savePlan, type LocalProfile } from "./local-store";
 import { evaluateMoneyExpression } from "./math-expression";
+import { ActionDialog, Icon, PaidCheckbox, SpendingRing } from "./interface";
 import {
   categorizeMerchant,
   defaultMerchantRules,
-  normalizeMerchant,
   parseStatementCsv,
   suggestedMerchantPattern,
   transactionFingerprint,
   type ImportAmountMode,
   type MerchantRule,
-  type StatementTransaction,
 } from "./statement-import";
 
-type Income = { id: string; name: string; owner: string; amount: number; expectedRemaining?: number };
-type Allocation = {
-  id: string;
-  name: string;
-  group: string;
-  amount: number;
-  actual?: number | null;
-  actualMode?: "auto" | "manual";
-  linked?: "calendar" | "debt" | "goals" | "investing";
-};
-type Bill = {
-  id: string;
-  name: string;
-  categoryId: string;
-  amount: number;
-  dueDay: number;
-  frequency: "Monthly" | "Annual";
-  dueMonth?: number;
-  paid?: boolean;
-  paidAmount?: number;
-  includedInProjection?: boolean;
-  matchedTransactionId?: string;
-};
-type Debt = { id: string; name: string; categoryId: string; balance: number; apr: number; minimum: number; extra: number };
-type Goal = { id: string; name: string; current: number; target: number; monthly: number; targetDate: string };
-type InvestmentBucket = { id: string; name: string; percent: number };
-type Asset = { id: string; name: string; type: string; balance: number };
-type Transaction = {
-  id: string;
-  date: string;
-  description: string;
-  categoryId: string;
-  owner?: string;
-  account?: string;
-  amount: number;
-  source?: "manual" | "import";
-  reviewNeeded?: boolean;
-  fingerprint?: string;
-  billId?: string;
-};
-type ImportPreviewTransaction = StatementTransaction & {
-  id: string;
-  categoryId: string;
-  reviewNeeded: boolean;
-  duplicate: boolean;
-};
-
-type MonthSnapshot = {
-  dataVersion?: number;
-  incomes: Income[];
-  allocations: Allocation[];
-  bills: Bill[];
-  debts: Debt[];
-  goals: Goal[];
-  investmentMonthly: number;
-  investmentBuckets: InvestmentBucket[];
-  assets: Asset[];
-  transactions: Transaction[];
-};
-
-type Plan = MonthSnapshot & {
-  month: string;
-  months: Record<string, MonthSnapshot>;
-  years: number[];
-  expectedDefaults: Record<string, number>;
-  merchantRules: MerchantRule[];
-  savingsTargets: { minimum: number; ideal: number };
-};
-
-const LEGACY_STORAGE_KEY = "paycheck-plan-v1";
-const ACTIVE_PROFILE_KEY = "paycheck-active-profile-v1";
-const DATA_VERSION = 3;
-
-const spendingCategories = [
-  { id: "groceries", name: "Groceries", color: "#2f8f67", soft: "#e4f4ec" },
-  { id: "gas", name: "Gas", color: "#cb7a2b", soft: "#fbefdf" },
-  { id: "fast-food", name: "Fast Food", color: "#d65b45", soft: "#fbe8e4" },
-  { id: "restaurants", name: "Restaurants", color: "#9a67c8", soft: "#f1e9f8" },
-  { id: "bills", name: "Bills", color: "#397db5", soft: "#e6f0f8" },
-  { id: "subscriptions", name: "Subscriptions", color: "#725dc1", soft: "#ece9f8" },
-  { id: "car-transportation", name: "Car / Transportation", color: "#2f9aa0", soft: "#e1f3f3" },
-  { id: "personal", name: "Personal", color: "#ba6d87", soft: "#f8e9ee" },
-  { id: "shopping", name: "Shopping", color: "#b08a2e", soft: "#f7f0dd" },
-  { id: "other-uncategorized", name: "Other / Uncategorized", color: "#71817d", soft: "#edf1ef" },
-  { id: "giving", name: "Giving", color: "#e27739", soft: "#fcece2" },
-  { id: "tax", name: "Tax", color: "#6f63a8", soft: "#eceaf5" },
-] as const;
-
-const spendingCategoryIds = new Set<string>(spendingCategories.map((category) => category.id));
-const legacyAllocationMap: Record<string, string> = {
-  tithe: "giving",
-  rent: "bills",
-  fpl: "bills",
-  "car-insurance": "car-transportation",
-  fun: "personal",
-  health: "personal",
-  misc: "other-uncategorized",
-  unexpected: "other-uncategorized",
-};
-
-function canonicalSpendingCategory(id: string) {
-  if (spendingCategoryIds.has(id)) return id;
-  if (legacyAllocationMap[id]) return legacyAllocationMap[id];
-  if (id === "car-payment") return "car-transportation";
-  if (id === "credit-card" || id.startsWith("debt-")) return "bills";
-  return "other-uncategorized";
-}
-
-const initialPlan: Plan = {
-  dataVersion: DATA_VERSION,
-  month: "2026-08",
-  incomes: [
-    { id: "income-primary", name: "Primary income", owner: "Me", amount: 0 },
-    { id: "income-secondary", name: "Secondary income", owner: "Me", amount: 0 },
-    { id: "income-partner", name: "Partner income", owner: "Partner", amount: 0 },
-    { id: "income-other", name: "Other income", owner: "Household", amount: 0 },
-  ],
-  allocations: [
-    { id: "groceries", name: "Groceries", group: "Spending", amount: 0 },
-    { id: "gas", name: "Gas", group: "Spending", amount: 0 },
-    { id: "fast-food", name: "Fast Food", group: "Spending", amount: 0 },
-    { id: "restaurants", name: "Restaurants", group: "Spending", amount: 0 },
-    { id: "bills", name: "Bills", group: "Spending", amount: 0 },
-    { id: "subscriptions", name: "Subscriptions", group: "Spending", amount: 0 },
-    { id: "car-transportation", name: "Car / Transportation", group: "Spending", amount: 0 },
-    { id: "personal", name: "Personal", group: "Spending", amount: 0 },
-    { id: "shopping", name: "Shopping", group: "Spending", amount: 0 },
-    { id: "other-uncategorized", name: "Other / Uncategorized", group: "Spending", amount: 0 },
-    { id: "giving", name: "Giving", group: "Giving", amount: 0 },
-    { id: "tax", name: "Tax", group: "Tax", amount: 0 },
-    { id: "credit-card", name: "Credit card payment", group: "Debt", amount: 0, linked: "debt" },
-    { id: "car-payment", name: "Vehicle payment", group: "Debt", amount: 0, linked: "debt" },
-    { id: "saving", name: "Savings", group: "Goals", amount: 0, linked: "goals" },
-    { id: "stocks", name: "Stocks & investing", group: "Investing", amount: 0, linked: "investing" },
-    { id: "funded", name: "Funded-account fees", group: "Investing", amount: 0 },
-  ],
-  bills: [
-    { id: "bill-rent", name: "Rent", categoryId: "bills", amount: 0, dueDay: 1, frequency: "Monthly", paid: false, includedInProjection: true },
-    { id: "bill-electricity", name: "Electricity", categoryId: "bills", amount: 0, dueDay: 12, frequency: "Monthly", paid: false, includedInProjection: true },
-    { id: "bill-insurance", name: "Car insurance", categoryId: "car-transportation", amount: 0, dueDay: 18, frequency: "Monthly", paid: false, includedInProjection: true },
-  ],
-  debts: [
-    { id: "credit-card-debt", name: "Credit card", categoryId: "credit-card", balance: 0, apr: 0, minimum: 0, extra: 0 },
-    { id: "vehicle-debt", name: "Vehicle loan", categoryId: "car-payment", balance: 0, apr: 0, minimum: 0, extra: 0 },
-  ],
-  goals: [
-    { id: "emergency", name: "Emergency fund", current: 0, target: 0, monthly: 0, targetDate: "2027-01" },
-    { id: "general", name: "Major purchase / general savings", current: 0, target: 0, monthly: 0, targetDate: "2027-06" },
-  ],
-  investmentMonthly: 0,
-  investmentBuckets: [
-    { id: "market", name: "Stocks & ETFs", percent: 50 },
-    { id: "crypto", name: "Crypto", percent: 30 },
-    { id: "trading", name: "Funded trading", percent: 20 },
-  ],
-  assets: [
-    { id: "checking", name: "Checking", type: "Cash", balance: 0 },
-    { id: "savings-account", name: "Savings", type: "Cash", balance: 0 },
-    { id: "business", name: "Business", type: "Business", balance: 0 },
-    { id: "investments", name: "Investments", type: "Investments", balance: 0 },
-    { id: "property", name: "Property", type: "Property", balance: 0 },
-  ],
-  transactions: [],
-  months: {},
-  years: [2026],
-  expectedDefaults: {},
-  merchantRules: [],
-  savingsTargets: { minimum: 0, ideal: 0 },
-};
-
-function normalizeAllocation(item: Allocation): Allocation {
-  return {
-    ...item,
-    actual: Object.prototype.hasOwnProperty.call(item, "actual") ? item.actual ?? null : null,
-    actualMode: "manual",
-  };
-}
-
-function normalizeMonth(raw?: Partial<MonthSnapshot> | null): MonthSnapshot {
-  const savedAllocations = raw?.allocations || [];
-  const isCurrentModel = raw?.dataVersion === DATA_VERSION;
-  const seedIds = new Set(initialPlan.allocations.map((item) => item.id));
-  const transactions = (raw?.transactions || []).map((transaction) => ({
-    ...transaction,
-    categoryId: canonicalSpendingCategory(transaction.categoryId),
-    account: transaction.account || transaction.owner || "Household",
-    source: transaction.source || "manual" as const,
-    reviewNeeded: transaction.reviewNeeded ?? canonicalSpendingCategory(transaction.categoryId) === "other-uncategorized",
-    fingerprint: transaction.fingerprint || transactionFingerprint(
-      transaction.date,
-      transaction.description,
-      transaction.amount,
-      transaction.account || transaction.owner || "Household",
-    ),
-  }));
-  const bills = (raw?.bills || structuredClone(initialPlan.bills)).map((bill) => {
-    const legacyAllocation = savedAllocations.find((item) => item.id === bill.categoryId);
-    const inferredPaid = !isCurrentModel && legacyAllocation?.actualMode === "auto" && (legacyAllocation.actual ?? 0) > 0;
-    const paid = bill.paid ?? inferredPaid;
-    return {
-      ...bill,
-      categoryId: canonicalSpendingCategory(bill.categoryId),
-      paid,
-      paidAmount: paid ? bill.paidAmount ?? bill.amount : bill.paidAmount,
-      includedInProjection: bill.includedInProjection ?? true,
-    };
-  });
-  const transactionTotals = transactions.reduce<Record<string, number>>((totals, transaction) => {
-    totals[transaction.categoryId] = (totals[transaction.categoryId] || 0) + transaction.amount;
-    return totals;
-  }, {});
-  const paidBillTotals = bills.filter((bill) => bill.paid).reduce<Record<string, number>>((totals, bill) => {
-    totals[bill.categoryId] = (totals[bill.categoryId] || 0) + (bill.paidAmount ?? bill.amount);
-    return totals;
-  }, {});
-  const seeded = initialPlan.allocations.map((seed) => {
-    const sources = savedAllocations.filter((item) => (legacyAllocationMap[item.id] || item.id) === seed.id);
-    if (sources.length === 0) return normalizeAllocation(seed);
-    if (isCurrentModel) {
-      const saved = sources.find((item) => item.id === seed.id) || sources[0];
-      return normalizeAllocation({ ...seed, ...saved, group: seed.group, linked: seed.linked });
-    }
-    const amount = sources.reduce((sum, item) => sum + (item.amount || 0), 0);
-    const legacyActual = sources.reduce((sum, item) => sum + (item.actual ?? 0), 0);
-    const isSpending = spendingCategoryIds.has(seed.id);
-    const actual = isSpending
-      ? Math.max(0, legacyActual - (transactionTotals[seed.id] || 0) - (paidBillTotals[seed.id] || 0))
-      : legacyActual || null;
-    return normalizeAllocation({ ...seed, amount, actual, group: seed.group, linked: seed.linked });
-  });
-  const custom = savedAllocations
-    .filter((item) => !seedIds.has(item.id) && !legacyAllocationMap[item.id])
-    .map((item) => normalizeAllocation(item));
-  return {
-    dataVersion: DATA_VERSION,
-    incomes: raw?.incomes?.length
-      ? raw.incomes.map((item) => ({ expectedRemaining: 0, ...item }))
-      : structuredClone(initialPlan.incomes),
-    allocations: [...seeded, ...custom],
-    bills,
-    debts: raw?.debts || structuredClone(initialPlan.debts),
-    goals: raw?.goals || structuredClone(initialPlan.goals),
-    investmentMonthly: raw?.investmentMonthly || 0,
-    investmentBuckets: raw?.investmentBuckets || structuredClone(initialPlan.investmentBuckets),
-    assets: raw?.assets || structuredClone(initialPlan.assets),
-    transactions,
-  };
-}
-
-function normalizePlan(raw?: Partial<Plan> | null): Plan {
-  const month = raw?.month || initialPlan.month;
-  const current = normalizeMonth(raw);
-  const months = Object.fromEntries(
-    Object.entries(raw?.months || {}).map(([key, value]) => [key, normalizeMonth(value)]),
-  );
-  const years = [...new Set([
-    ...(raw?.years || []),
-    Number(month.slice(0, 4)),
-    ...Object.keys(months).map((key) => Number(key.slice(0, 4))),
-  ])].filter(Number.isFinite).sort((a, b) => a - b);
-  const expectedDefaults = {
-    ...Object.fromEntries(current.allocations.map((item) => [item.id, item.amount])),
-    ...(raw?.expectedDefaults || {}),
-  };
-  return {
-    month,
-    ...current,
-    months,
-    years,
-    expectedDefaults,
-    merchantRules: raw?.merchantRules || [],
-    savingsTargets: {
-      minimum: raw?.savingsTargets?.minimum ?? initialPlan.savingsTargets.minimum,
-      ideal: raw?.savingsTargets?.ideal ?? initialPlan.savingsTargets.ideal,
-    },
-  };
-}
-
-function monthSnapshot(plan: MonthSnapshot): MonthSnapshot { return normalizeMonth(plan); }
-
-function setExpectedOnSnapshot(raw: MonthSnapshot, id: string, amount: number): MonthSnapshot {
-  const snapshot = monthSnapshot(raw);
-  const target = snapshot.allocations.find((item) => item.id === id);
-  if (!target) return snapshot;
-  return {
-    ...snapshot,
-    allocations: snapshot.allocations.map((item) => item.id === id ? { ...item, amount } : item),
-  };
-}
-
-function nextMonthSnapshot(plan: MonthSnapshot, expectedDefaults: Record<string, number>): MonthSnapshot {
-  let next = monthSnapshot(plan);
-  for (const [id, amount] of Object.entries(expectedDefaults)) next = setExpectedOnSnapshot(next, id, amount);
-  return {
-    ...next,
-    incomes: next.incomes.map((item) => ({ ...item, amount: 0, expectedRemaining: item.amount + (item.expectedRemaining || 0) })),
-    allocations: next.allocations.map((item) => ({ ...item, actual: null, actualMode: "manual" })),
-    bills: next.bills.map((bill) => ({ ...bill, paid: false, paidAmount: undefined })),
-    transactions: [],
-  };
-}
-
-function billIsVisible(bill: Bill, monthKey: string) {
-  const month = Number(monthKey.slice(5, 7));
-  return bill.frequency === "Monthly" || bill.dueMonth === month;
-}
-
-function reconcileBillTransactions(snapshot: MonthSnapshot, monthKey: string): MonthSnapshot {
-  let transactions = snapshot.transactions.map((transaction) => ({ ...transaction }));
-  const transactionIds = new Set(transactions.map((transaction) => transaction.id));
-  let bills = snapshot.bills.map((bill) => bill.matchedTransactionId && !transactionIds.has(bill.matchedTransactionId)
-    ? { ...bill, paid: false, paidAmount: undefined, matchedTransactionId: undefined }
-    : { ...bill });
-  const linkedIds = new Set(bills.map((bill) => bill.matchedTransactionId).filter(Boolean));
-  transactions = transactions.map((transaction) => transaction.billId && !bills.some((bill) => bill.id === transaction.billId)
-    ? { ...transaction, billId: undefined }
-    : transaction);
-
-  bills = bills.map((bill) => {
-    if (!billIsVisible(bill, monthKey) || bill.matchedTransactionId) return bill;
-    const billName = normalizeMerchant(bill.name);
-    const candidates = transactions.filter((transaction) => {
-      if (transaction.billId || linkedIds.has(transaction.id) || transaction.date.slice(0, 7) !== monthKey) return false;
-      if (canonicalSpendingCategory(transaction.categoryId) !== canonicalSpendingCategory(bill.categoryId)) return false;
-      if (Math.abs(transaction.amount - bill.amount) > 0.01) return false;
-      const day = Number(transaction.date.slice(8, 10));
-      const nameMatch = normalizeMerchant(transaction.description).includes(billName) || billName.includes(normalizeMerchant(transaction.description));
-      return nameMatch || Math.abs(day - bill.dueDay) <= 5;
-    });
-    if (candidates.length !== 1) return bill;
-    const match = candidates[0];
-    linkedIds.add(match.id);
-    transactions = transactions.map((transaction) => transaction.id === match.id ? { ...transaction, billId: bill.id } : transaction);
-    return { ...bill, paid: true, paidAmount: match.amount, matchedTransactionId: match.id };
-  });
-  return { ...snapshot, bills, transactions };
-}
-
-function allocationSpendingCategory(item: Allocation) {
-  if (spendingCategoryIds.has(item.id)) return item.id;
-  if (legacyAllocationMap[item.id]) return legacyAllocationMap[item.id];
-  if (item.linked === "debt") return item.id === "car-payment" ? "car-transportation" : "bills";
-  if (item.id === "funded") return "other-uncategorized";
-  return null;
-}
-
-function summarizeMonth(plan: MonthSnapshot, monthKey: string) {
-  const incomeReceived = plan.incomes.reduce((sum, item) => sum + item.amount, 0);
-  const expectedIncome = plan.incomes.reduce((sum, item) => sum + (item.expectedRemaining || 0), 0);
-  const income = incomeReceived + expectedIncome;
-  const allocated = plan.allocations.reduce((sum, item) => sum + item.amount, 0);
-  const groups = plan.allocations.reduce<Record<string, number>>((all, item) => {
-    all[item.group] = (all[item.group] || 0) + item.amount;
-    return all;
-  }, {});
-  const categoryActuals = Object.fromEntries(spendingCategories.map((category) => [category.id, 0])) as Record<string, number>;
-  const categoryTargets = Object.fromEntries(spendingCategories.map((category) => [category.id, 0])) as Record<string, number>;
-  plan.allocations.forEach((item) => {
-    const categoryId = allocationSpendingCategory(item);
-    if (!categoryId) return;
-    categoryTargets[categoryId] = (categoryTargets[categoryId] || 0) + item.amount;
-    categoryActuals[categoryId] = (categoryActuals[categoryId] || 0) + (item.actual ?? 0);
-  });
-  plan.transactions.forEach((transaction) => {
-    const categoryId = canonicalSpendingCategory(transaction.categoryId);
-    categoryActuals[categoryId] = (categoryActuals[categoryId] || 0) + transaction.amount;
-  });
-  const visibleBills = plan.bills.filter((bill) => billIsVisible(bill, monthKey));
-  visibleBills.filter((bill) => bill.paid && !bill.matchedTransactionId).forEach((bill) => {
-    const categoryId = canonicalSpendingCategory(bill.categoryId);
-    categoryActuals[categoryId] = (categoryActuals[categoryId] || 0) + (bill.paidAmount ?? bill.amount);
-  });
-  const spent = Object.values(categoryActuals).reduce((sum, amount) => sum + amount, 0);
-  const remainingBills = visibleBills
-    .filter((bill) => !bill.paid && bill.includedInProjection !== false)
-    .reduce((sum, bill) => sum + bill.amount, 0);
-  const debt = plan.debts.reduce((sum, item) => sum + item.balance, 0);
-  const assets = plan.assets.reduce((sum, item) => sum + item.balance, 0);
-  return {
-    incomeReceived,
-    expectedIncome,
-    income,
-    allocated,
-    available: income - allocated,
-    projectedBalance: income - spent - remainingBills,
-    remainingBills,
-    categoryActuals,
-    categoryTargets,
-    groups,
-    spent,
-    reviewNeeded: plan.transactions.filter((transaction) => transaction.reviewNeeded).length,
-    debt,
-    assets,
-    netWorth: assets - debt,
-  };
-}
-function freshPlan(): Plan { return normalizePlan(structuredClone(initialPlan)); }
+import {
+  initialPlan, LEGACY_STORAGE_KEY, ACTIVE_PROFILE_KEY, spendingCategories,
+  normalizePlan, normalizeMonth, freshPlan, monthSnapshot, nextMonthSnapshot, setExpectedOnSnapshot,
+  summarizeMonth, billIsVisible, allocationSpendingCategory, canonicalSpendingCategory,
+  reconcileBillTransactions, setBillPayment, patchBillInMonth,
+  type Plan, type MonthSnapshot, type Bill, type Debt, type Goal, type Transaction,
+  type Allocation, type ImportPreviewTransaction,
+} from "./budget-model";
 
 const navItems = [
-  ["dashboard", "⌂", "Dashboard"],
-  ["budget", "▦", "Monthly plan"],
-  ["calendar", "□", "Bills & calendar"],
-  ["debt", "↘", "Debt planner"],
-  ["goals", "◎", "Savings goals"],
-  ["investing", "↗", "Investing"],
-  ["activity", "≡", "Transactions"],
-  ["worth", "◇", "Net worth"],
-  ["learn", "i", "Saving & help"],
+  ["dashboard", "dashboard", "Overview"],
+  ["activity", "activity", "Spending"],
+  ["calendar", "calendar", "Bills & subscriptions"],
+  ["budget", "budget", "Monthly plan"],
+  ["goals", "goals", "Savings goals"],
+  ["debt", "debt", "Debt planner"],
+  ["investing", "investing", "Investing"],
+  ["worth", "worth", "Net worth"],
+  ["learn", "learn", "Saving & help"],
 ] as const;
 
 const money = new Intl.NumberFormat("en-US", {
@@ -462,7 +72,7 @@ function CurrencyInput({
   }
 
   return (
-    <label className={disabled ? "money-input disabled" : "money-input"} title="You can enter a number or calculation, such as =1200+350">
+    <span className={disabled ? "money-input disabled" : "money-input"} title="You can enter a number or calculation, such as =1200+350">
       <span>$</span>
       <input
         aria-label={ariaLabel}
@@ -470,7 +80,7 @@ function CurrencyInput({
         type="text"
         disabled={disabled}
         value={draft}
-        placeholder="0 or =100+25"
+        placeholder="0.00"
         onFocus={() => { focused.current = true; }}
         onBlur={() => { focused.current = false; commit(draft); }}
         onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
@@ -485,7 +95,7 @@ function CurrencyInput({
         }}
       />
       <small aria-hidden="true">fx</small>
-    </label>
+    </span>
   );
 }
 
@@ -513,7 +123,7 @@ function ActualCurrencyInput({ value, onChange, ariaLabel }: { value: number | n
   }
 
   return (
-    <label className="money-input actual-input" title="Enter the total actually spent, or a calculation such as =100+25">
+    <span className="money-input actual-input" title="Enter the total actually spent, or a calculation such as =100+25">
       <span>$</span>
       <input
         aria-label={ariaLabel}
@@ -535,16 +145,16 @@ function ActualCurrencyInput({ value, onChange, ariaLabel }: { value: number | n
         }}
       />
       <small aria-hidden="true">fx</small>
-    </label>
+    </span>
   );
 }
 
 function NumberInput({ value, onChange, ariaLabel, suffix }: { value: number; onChange: (next: number) => void; ariaLabel: string; suffix?: string }) {
   return (
-    <label className="number-input">
+    <span className="number-input">
       <input aria-label={ariaLabel} inputMode="decimal" min="0" type="number" value={value || ""} placeholder="0" onChange={(event) => onChange(Math.max(0, Number(event.target.value) || 0))} />
       {suffix && <span>{suffix}</span>}
-    </label>
+    </span>
   );
 }
 
@@ -591,6 +201,16 @@ export default function Home() {
   const statementInputRef = useRef<HTMLInputElement>(null);
   const planRef = useRef(plan);
   const [transactionCategoryFilter, setTransactionCategoryFilter] = useState("all");
+  const [dialog, setDialog] = useState<"transaction" | "import" | "income" | "more" | "bill" | null>(null);
+  const [transactionSearch, setTransactionSearch] = useState("");
+  const [activityTab, setActivityTab] = useState<"all" | "review">("all");
+  const [billTab, setBillTab] = useState<"unpaid" | "paid" | "all">("unpaid");
+  const [billView, setBillView] = useState<"list" | "calendar">("list");
+  const [editingBillId, setEditingBillId] = useState<string | null>(null);
+  const [billEditScope, setBillEditScope] = useState<"month" | "future">("month");
+  const [categoryDetail, setCategoryDetail] = useState<string | null>(null);
+  const [allCategoriesVisible, setAllCategoriesVisible] = useState(false);
+  const [undoBill, setUndoBill] = useState<{ month: string; bill: Bill; message: string } | null>(null);
   const [transactionDraft, setTransactionDraft] = useState({
     date: "2026-08-01",
     description: "",
@@ -741,7 +361,7 @@ export default function Home() {
     const count = new Date(selectedYear, selectedMonth, 0).getDate();
     return [...Array(firstDay).fill(null), ...Array.from({ length: count }, (_, index) => index + 1)];
   }, [selectedMonth, selectedYear]);
-  const monthlyBillTotal = plan.bills.reduce((sum, bill) => sum + (bill.frequency === "Annual" ? bill.amount / 12 : bill.amount), 0);
+
   const visibleBills = plan.bills.filter((bill) => billIsVisible(bill, plan.month));
   const debtMonthly = plan.debts.reduce((sum, debt) => sum + debt.minimum + debt.extra, 0);
   const bucketPercent = plan.investmentBuckets.reduce((sum, bucket) => sum + bucket.percent, 0);
@@ -759,9 +379,63 @@ export default function Home() {
   const projectedForSavings = Math.max(0, dashboardTotals.projectedBalance);
   const savingsProgress = idealSavingsTarget ? Math.min(100, projectedForSavings / idealSavingsTarget * 100) : 0;
   const reviewTransactions = plan.transactions.filter((transaction) => transaction.reviewNeeded);
-  const filteredTransactions = transactionCategoryFilter === "all"
-    ? plan.transactions
-    : plan.transactions.filter((transaction) => canonicalSpendingCategory(transaction.categoryId) === transactionCategoryFilter);
+  const filteredTransactions = plan.transactions
+    .filter((transaction) => transactionCategoryFilter === "all" || canonicalSpendingCategory(transaction.categoryId) === transactionCategoryFilter)
+    .filter((transaction) => activityTab !== "review" || transaction.reviewNeeded)
+    .filter((transaction) => `${transaction.description} ${transaction.account || transaction.owner || ""}`.toLowerCase().includes(transactionSearch.toLowerCase()))
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const sortedCategories = [...dashboardCategories].sort((a, b) => b.spent - a.spent);
+  const shownCategories = allCategoriesVisible ? sortedCategories : sortedCategories.slice(0, 6);
+  const unpaidBills = visibleBills.filter((bill) => !bill.paid).sort((a, b) => a.dueDay - b.dueDay);
+  const paidBills = visibleBills.filter((bill) => bill.paid).sort((a, b) => a.dueDay - b.dueDay);
+  const listedBills = billTab === "all" ? [...plan.bills].sort((a, b) => a.dueDay - b.dueDay) : billTab === "paid" ? paidBills : unpaidBills;
+  const editingBill = plan.bills.find((bill) => bill.id === editingBillId);
+  const detailCategory = spendingCategories.find((category) => category.id === categoryDetail);
+  const categorySnapshots = dashboardView === "yearly" && active === "dashboard"
+    ? yearlyMonths.filter((item) => item.hasData).map((item) => ({ month: item.key, snapshot: item.key === plan.month ? monthSnapshot(plan) : plan.months[item.key] }))
+    : [{ month: plan.month, snapshot: monthSnapshot(plan) }];
+  const detailEntries = categorySnapshots.flatMap(({ month, snapshot }) => [
+    ...snapshot.transactions.filter((transaction) => canonicalSpendingCategory(transaction.categoryId) === categoryDetail).map((transaction) => ({ id: transaction.id, description: transaction.description, date: transaction.date, amount: transaction.amount, note: transaction.account || transaction.owner || "Transaction" })),
+    ...snapshot.bills.filter((bill) => bill.paid && !bill.matchedTransactionId && billIsVisible(bill, month) && canonicalSpendingCategory(bill.categoryId) === categoryDetail).map((bill) => ({ id: `${month}-${bill.id}`, description: bill.name, date: `${month}-${String(Math.min(bill.dueDay, new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0).getDate())).padStart(2, "0")}`, amount: bill.paidAmount ?? bill.amount, note: "Paid bill" })),
+    ...snapshot.allocations.filter((item) => allocationSpendingCategory(item) === categoryDetail && item.actual).map((item) => ({ id: `${month}-${item.id}`, description: "Unitemized spending", date: `${month}-01`, amount: item.actual || 0, note: "Category total entered manually" })),
+  ]).sort((a, b) => b.date.localeCompare(a.date));
+
+  function navigate(section: string) {
+    setActive(section);
+    setDialog(null);
+    setCategoryDetail(null);
+    window.scrollTo({ top: 0 });
+  }
+
+  function openBill(id: string | null) {
+    setEditingBillId(id);
+    setBillEditScope("month");
+    setDialog("bill");
+  }
+
+  function editBill(patch: Partial<Bill>) {
+    if (!editingBill) return;
+    if (billEditScope === "future") updateBill(editingBill.id, patch);
+    else updateBillForThisMonth(editingBill.id, {
+      ...patch,
+      ...(patch.amount !== undefined && editingBill.paid && !editingBill.matchedTransactionId ? { paidAmount: patch.amount } : {}),
+    });
+  }
+
+  function billDueLabel(bill: Bill) {
+    const month = bill.frequency === "Annual" ? bill.dueMonth || selectedMonth : selectedMonth;
+    const day = Math.min(bill.dueDay, new Date(selectedYear, month, 0).getDate());
+    return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(selectedYear, month - 1, day));
+  }
+
+  function renderBill(bill: Bill) {
+    const category = spendingCategories.find((item) => item.id === canonicalSpendingCategory(bill.categoryId));
+    return <article className={bill.paid ? "checklist-row is-paid" : "checklist-row"} id={bill.id} key={bill.id}>
+      <PaidCheckbox name={bill.name} paid={Boolean(bill.paid)} onChange={() => toggleBillPaid(bill.id)} disabled={Boolean(bill.matchedTransactionId)} />
+      <button className="bill-identity" onClick={() => openBill(bill.id)}><span className="category-icon" style={{ color: category?.color, background: category?.soft }}><Icon name={category?.id || "bills"} /></span><span><strong>{bill.name}</strong><small>{bill.paid ? (bill.matchedTransactionId ? "Matched payment" : "Paid") : `Due ${billDueLabel(bill)}`}<span className="bill-projection-label"> · {bill.paid ? "In actual spending" : bill.includedInProjection === false ? "Not in balance" : "In projected balance"}</span></small></span></button>
+      <button className="bill-amount" aria-label={`Edit ${bill.name} amount`} onClick={() => openBill(bill.id)}>{money.format(bill.paid ? bill.paidAmount ?? bill.amount : bill.amount)}<Icon name="chevron" size={16} /></button>
+    </article>;
+  }
 
   function changeMonth(nextMonth: string) {
     if (!nextMonth || nextMonth === plan.month) return;
@@ -850,24 +524,17 @@ export default function Home() {
   }
 
   function updateBillForThisMonth(id: string, patch: Partial<Bill>) {
-    setPlan((current) => ({
-      ...current,
-      bills: current.bills.map((bill) => bill.id === id ? { ...bill, ...patch } : bill),
-    }));
+    setPlan((current) => ({ ...current, ...patchBillInMonth(current, id, patch) }));
   }
 
   function toggleBillPaid(id: string) {
     const bill = plan.bills.find((item) => item.id === id);
     if (!bill) return;
-    setPlan((current) => ({
-      ...current,
-      bills: current.bills.map((item) => item.id === id
-        ? item.paid
-          ? { ...item, paid: false, paidAmount: undefined, matchedTransactionId: undefined }
-          : { ...item, paid: true, paidAmount: item.amount }
-        : item),
-      transactions: current.transactions.map((transaction) => transaction.billId === id ? { ...transaction, billId: undefined } : transaction),
-    }));
+    if (bill.matchedTransactionId) { setNotice("This bill is matched to a transaction. Edit that transaction to change its payment."); return; }
+    const message = `${bill.name} marked ${bill.paid ? "unpaid" : "paid"}.`;
+    setUndoBill({ month: plan.month, bill: { ...bill }, message });
+    setNotice(message);
+    setPlan((current) => ({ ...current, ...setBillPayment(current, id, !bill.paid) }));
   }
 
   function toggleBillProjection(id: string) {
@@ -905,6 +572,7 @@ export default function Home() {
         months: Object.fromEntries(Object.entries(current.months).map(([key, snapshot]) => [key, key >= current.month ? addToSnapshot(snapshot) : snapshot])),
       };
     });
+    setDialog(null);
     setBillDraft({ name: "", categoryId: "subscriptions", amount: 0, dueDay: 1, frequency: "Monthly" });
     setNotice(`${bill.name} was added to ${monthLabel}.`);
   }
@@ -1012,7 +680,7 @@ export default function Home() {
   }
 
   function addTransaction() {
-    if (!transactionDraft.description.trim() || transactionDraft.amount <= 0) return;
+    if (!transactionDraft.description.trim() || transactionDraft.amount <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(transactionDraft.date)) { setNotice("Add a date, merchant, and amount first."); return; }
     const categoryId = transactionDraft.categoryId === "other-uncategorized"
       ? categorizeMerchant(transactionDraft.description, plan.merchantRules)
       : transactionDraft.categoryId;
@@ -1042,7 +710,9 @@ export default function Home() {
         years: [...new Set([...current.years, Number(transactionMonth.slice(0, 4))])].sort((a, b) => a - b),
       };
     });
-    setTransactionDraft((current) => ({ ...current, description: "", amount: 0 }));
+    setTransactionDraft((current) => ({ ...current, description: "", amount: 0, categoryId: "other-uncategorized" }));
+    setDialog(null);
+    setNotice(`Transaction added to ${transaction.date.slice(0, 7)}.`);
   }
 
   function deleteTransaction(id: string) {
@@ -1105,7 +775,7 @@ export default function Home() {
       const fingerprints = existingFingerprints();
       const preview = parsed.transactions.map((transaction) => {
         const categoryId = categorizeMerchant(transaction.description, plan.merchantRules);
-        const fingerprint = transactionFingerprint(transaction.date, transaction.description, transaction.amount, account);
+        const fingerprint = transactionFingerprint(transaction.date, transaction.description, transaction.amount, account.trim() || "Imported statement");
         const duplicate = fingerprints.has(fingerprint);
         fingerprints.add(fingerprint);
         return {
@@ -1128,16 +798,25 @@ export default function Home() {
   async function handleStatementFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file) return;
+    if (file) await readStatementFile(file);
+  }
+
+  async function readStatementFile(file: File) {
+    setImportPreview([]);
+    setStatementText("");
+    setStatementName("");
+    if (file.size > 10 * 1024 * 1024) { setImportError("Choose a CSV smaller than 10 MB, or export a shorter date range."); return; }
     if (!file.name.toLowerCase().endsWith(".csv")) {
       setImportError("Download a CSV statement from your bank or card account. PDF statements are not supported in the private local importer.");
       return;
     }
-    const text = await file.text();
-    setStatementText(text);
-    setStatementName(file.name);
-    setImportMode("auto");
-    prepareStatement(text, "auto");
+    try {
+      const text = await file.text();
+      setStatementText(text);
+      setStatementName(file.name);
+      setImportMode("auto");
+      prepareStatement(text, "auto");
+    } catch { setImportError("The file could not be read. Please choose it again."); }
   }
 
   function importStatementTransactions() {
@@ -1175,7 +854,14 @@ export default function Home() {
       const years = [...new Set([...current.years, ...readyTransactions.map((item) => Number(item.date.slice(0, 4)))])].sort((a, b) => a - b);
       return { ...current, ...activeSnapshot, months: snapshots, years };
     });
+    const importedMonths = [...new Set(readyTransactions.map((item) => item.date.slice(0, 7)))].sort();
+    if (!importedMonths.includes(plan.month)) changeMonth(importedMonths[importedMonths.length - 1]);
     const reviewCount = readyTransactions.filter((item) => item.reviewNeeded).length;
+    setDialog(null);
+    setActive("activity");
+    setActivityTab(reviewCount ? "review" : "all");
+    setTransactionCategoryFilter("all");
+    setTransactionSearch("");
     setImportPreview([]);
     setStatementText("");
     setStatementName("");
@@ -1307,37 +993,40 @@ export default function Home() {
 
   return (
     <>
+    <a className="skip-link" href="#workspace">Skip to content</a>
     <main className="app-shell">
       <aside className="sidebar">
         <button className="brand" onClick={() => setActive("dashboard")}>
           <span className="brand-mark">P</span>
           <span>
             <strong>Paycheck</strong>
-            <small>Household planner</small>
+            <small>Your money, clearer</small>
           </span>
         </button>
 
         <nav aria-label="Primary navigation">
-          <p className="nav-label">PLAN</p>
-          {navItems.slice(0, 6).map(([id, icon, label]) => (
+          <p className="nav-label">YOUR MONTH</p>
+          {navItems.slice(0, 3).map(([id, icon, label]) => (
             <button
               key={id}
               className={active === id ? "nav-item active" : "nav-item"}
-              onClick={() => setActive(id)}
+              aria-current={active === id ? "page" : undefined}
+              title={label}
+              onClick={() => navigate(id)}
             >
-              <span>{icon}</span>
-              {label}
+              <Icon name={icon} /><span className="nav-text">{label}</span>
             </button>
           ))}
-          <p className="nav-label second">TRACK</p>
-          {navItems.slice(6).map(([id, icon, label]) => (
+          <p className="nav-label second">MORE TOOLS</p>
+          {navItems.slice(3).map(([id, icon, label]) => (
             <button
               key={id}
               className={active === id ? "nav-item active" : "nav-item"}
-              onClick={() => setActive(id)}
+              aria-current={active === id ? "page" : undefined}
+              title={label}
+              onClick={() => navigate(id)}
             >
-              <span>{icon}</span>
-              {label}
+              <Icon name={icon} /><span className="nav-text">{label}</span>
             </button>
           ))}
         </nav>
@@ -1357,13 +1046,16 @@ export default function Home() {
         </div>
       </aside>
 
-      <section className="workspace">
+      <section className="workspace" id="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">HOUSEHOLD PLAN</p>
-            <h1>{active === "dashboard" ? "Spending and monthly balance." : navItems.find((item) => item[0] === active)?.[2]}</h1>
+            <p className="eyebrow">{activeProfile?.name || "MY HOUSEHOLD"}</p>
+            <h1>{active === "dashboard" ? "Your month at a glance" : navItems.find((item) => item[0] === active)?.[2]}</h1>
           </div>
-          {active === "dashboard" && (
+          <button className="mobile-settings icon-button" aria-label="Save and restore" onClick={() => setSettingsOpen(true)}><Icon name="lock" /></button>
+        </header>
+        {active !== "learn" && <div className="workspace-toolbar">
+          {active === "dashboard" ? (
             <div className="period-controls">
               <div className="view-toggle" aria-label="Dashboard period">
                 <button className={dashboardView === "monthly" ? "active" : ""} onClick={() => setDashboardView("monthly")}>Monthly</button>
@@ -1378,76 +1070,49 @@ export default function Home() {
                 </div>
               )}
             </div>
-          )}
-          {active !== "dashboard" && active !== "learn" && <MonthNavigator value={plan.month} onChange={changeMonth} />}
-        </header>
+          ) : <MonthNavigator value={plan.month} onChange={changeMonth} />}
+          <div className="quick-actions"><button className="button-secondary" onClick={() => setDialog("import")}><Icon name="upload" size={18} /><span>Import CSV</span></button><button className="button-primary" onClick={() => setDialog("transaction")}><Icon name="plus" size={18} /><span>Add spending</span></button></div>
+        </div>}
 
         {active === "dashboard" && (
           <div className="dashboard">
-            <section className={dashboardTotals.projectedBalance < 0 ? "balance-card danger" : "balance-card"}>
-              <div className="balance-card-heading">
-                <div><p className="eyebrow">{dashboardPeriodLabel.toUpperCase()}</p><h2>{dashboardView === "monthly" ? "Projected monthly balance" : "Projected yearly balance"}</h2></div>
-                <button onClick={() => setActive("activity")}>Add or import spending →</button>
-              </div>
-              <div className="balance-card-body">
-                <div className="balance-result" aria-live="polite">
-                  <span>Expected at the end of {dashboardView === "monthly" ? "the month" : "the selected year"}</span>
-                  <strong>{money.format(dashboardTotals.projectedBalance)}</strong>
-                  <b>{dashboardTotals.projectedBalance >= 0 ? "Under income · money left over" : "Over income · overspent"}</b>
+            <div className="overview-grid">
+              <section className={dashboardTotals.projectedBalance < 0 ? "month-balance negative" : "month-balance"}>
+                <div className="balance-topline"><span><Icon name="worth" size={18} /> {dashboardView === "monthly" ? "Projected monthly balance" : "Projected yearly balance"}</span><span className="period-caption">{dashboardPeriodLabel}</span></div>
+                <div className="balance-number" aria-live="polite"><strong>{money.format(dashboardTotals.projectedBalance)}</strong><span>{dashboardTotals.projectedBalance > 0 ? "Under income · money left over" : dashboardTotals.projectedBalance < 0 ? "Over income · overspent" : "Income and spending are balanced"}</span></div>
+                <div className="money-path" aria-label="Projected balance calculation">
+                  <button onClick={() => { if (dashboardView === "monthly") setDialog("income"); else navigate("budget"); }}><span>Total income</span><strong>{money.format(dashboardTotals.income)}</strong><small>{money.format(dashboardTotals.incomeReceived)} received<br />{money.format(dashboardTotals.expectedIncome)} expected</small></button><span aria-hidden="true">−</span>
+                  <button onClick={() => navigate("activity")}><span>Actual spending</span><strong>{money.format(dashboardTotals.spent)}</strong><small>What has been spent</small></button><span aria-hidden="true">−</span>
+                  <button onClick={() => navigate("calendar")}><span>Remaining bills</span><strong>{money.format(dashboardTotals.remainingBills)}</strong><small>Unpaid & included</small></button>
                 </div>
-                <div className="balance-equation" aria-label="Projected balance calculation">
-                  <div><span>Total income</span><strong>{money.format(dashboardTotals.income)}</strong></div>
-                  <i>−</i>
-                  <div><span>Actual spending</span><strong>{money.format(dashboardTotals.spent)}</strong></div>
-                  <i>−</i>
-                  <div><span>Remaining bills</span><strong>{money.format(dashboardTotals.remainingBills)}</strong></div>
-                  <i>=</i>
-                  <div className="equation-total"><span>Projected balance</span><strong>{money.format(dashboardTotals.projectedBalance)}</strong></div>
-                </div>
-              </div>
-            </section>
-
-            <section className="dashboard-summary-grid">
-              <article className="panel income-summary-card">
-                <div className="panel-heading"><div><p className="eyebrow">MONTHLY INCOME SUMMARY</p><h2>Money coming in</h2></div><button onClick={() => setActive("budget")}>Update</button></div>
-                <div className="three-line-summary"><span>Received</span><strong>{money.format(dashboardTotals.incomeReceived)}</strong><span>Expected remaining</span><strong>{money.format(dashboardTotals.expectedIncome)}</strong><span>Total monthly income</span><strong>{money.format(dashboardTotals.income)}</strong></div>
-              </article>
-              <article className="panel savings-target-card">
-                <div className="panel-heading"><div><p className="eyebrow">SAVINGS TARGET</p><h2>{dashboardView === "monthly" ? "Protect monthly savings" : "Savings pace"}</h2></div><button onClick={() => setActive("budget")}>Edit</button></div>
-                <div className="target-amounts"><span>Minimum <b>{money.format(minimumSavingsTarget)}</b></span><span>Ideal <b>{money.format(idealSavingsTarget)}</b></span></div>
-                <div className="savings-track"><span style={{ width: `${savingsProgress}%` }} /></div>
-                <strong className={savingsTargetsConfigured && targetMonths > 0 && projectedForSavings >= minimumSavingsTarget ? "target-status on-track" : "target-status short"}>{targetMonths === 0 ? "Open a month to start the yearly view" : !savingsTargetsConfigured ? "Set your goals in Monthly Plan" : projectedForSavings >= idealSavingsTarget ? "Ideal goal covered" : projectedForSavings >= minimumSavingsTarget ? `${money.format(idealSavingsTarget - projectedForSavings)} from the ideal goal` : `${money.format(minimumSavingsTarget - projectedForSavings)} short of the minimum goal`}</strong>
-              </article>
-            </section>
-
-            <div className="dashboard-main-grid">
-              <section className="panel actual-spending-card">
-                <div className="panel-heading"><div><p className="eyebrow">ACTUAL SPENDING SUMMARY</p><h2>{money.format(dashboardTotals.spent)} spent</h2></div><button onClick={() => setActive("activity")}>{dashboardTotals.reviewNeeded ? `${dashboardTotals.reviewNeeded} need review` : "View transactions"}</button></div>
-                <p className="section-note">Categories show what was actually spent. Monthly targets do not affect these totals.</p>
-                <div className="actual-category-grid">{dashboardCategories.map((category) => {
-                  const share = dashboardTotals.spent ? category.spent / dashboardTotals.spent * 100 : 0;
-                  return <button key={category.id} onClick={() => { setTransactionCategoryFilter(category.id); setActive("activity"); }}>
-                    <span className="actual-category-dot" style={{ background: category.color }} />
-                    <div><strong>{category.name}</strong><small>{share ? `${share.toFixed(0)}% of spending` : "No spending yet"}</small><i><b style={{ width: `${share}%`, background: category.color }} /></i></div>
-                    <b>{money.format(category.spent)}</b>
-                  </button>;
-                })}</div>
+                <div className="balance-footnote"><Icon name="learn" size={15} /><span>Based on entered income, recorded spending, and known bills.</span></div>
               </section>
+              <section className="surface savings-focus">
+                <div className="section-heading"><span className="section-icon"><Icon name="goals" /></span><h2>Room for savings</h2><button className="icon-button" aria-label="Edit monthly savings goals" onClick={() => navigate("budget")}><Icon name="more" /></button></div>
+                <p className="savings-lead">{savingsTargetsConfigured ? "Your projected balance toward your goal" : "Give the money left over a purpose"}</p>
+                <strong className="savings-amount">{money.format(projectedForSavings)}<small>projected, not yet saved</small></strong>
+                <div className="savings-progress" role="progressbar" aria-label="Projected savings toward ideal goal" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(savingsProgress)}><span style={{ width: `${savingsProgress}%` }} />{idealSavingsTarget > 0 && <i style={{ left: `${Math.min(100, minimumSavingsTarget / idealSavingsTarget * 100)}%` }} />}</div>
+                <div className="savings-labels"><span>Minimum<strong>{money.format(minimumSavingsTarget)}</strong></span><span>Ideal<strong>{money.format(idealSavingsTarget)}</strong></span></div>
+                <div className="savings-guidance">{!savingsTargetsConfigured ? <button onClick={() => navigate("budget")}>Set your goals in Monthly Plan <Icon name="arrow" size={16} /></button> : targetMonths === 0 ? "Open a month to see your savings pace." : dashboardTotals.projectedBalance >= idealSavingsTarget ? <><Icon name="check" size={18} /> Your ideal goal is covered.</> : <>{money.format(Math.max(0, (dashboardTotals.projectedBalance >= minimumSavingsTarget ? idealSavingsTarget : minimumSavingsTarget) - dashboardTotals.projectedBalance))} to close the gap to your {dashboardTotals.projectedBalance >= minimumSavingsTarget ? "ideal" : "minimum"}.</>}</div>
+              </section>
+            </div>
 
-              {dashboardView === "monthly" ? <section className="panel remaining-bills-card">
-                <div className="panel-heading"><div><p className="eyebrow">REMAINING BILLS THIS MONTH</p><h2>{money.format(totals.remainingBills)} left</h2></div><button onClick={() => setActive("calendar")}>Calendar</button></div>
-                <p className="section-note">Mark a bill paid to move it into actual spending. The projection will not count it twice.</p>
-                <div className="dashboard-bill-list">{visibleBills.filter((bill) => !bill.paid).sort((a, b) => a.dueDay - b.dueDay).map((bill) => <article key={bill.id}>
-                  <button className="bill-check" aria-label={`Mark ${bill.name} paid`} onClick={() => toggleBillPaid(bill.id)}>○</button>
-                  <div><strong>{bill.name}</strong><small>Due {new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(selectedYear, selectedMonth - 1, bill.dueDay))}</small></div>
-                  <b>{money.format(bill.amount)}</b>
-                  <button className={bill.includedInProjection === false ? "projection-toggle excluded" : "projection-toggle"} onClick={() => toggleBillProjection(bill.id)}>{bill.includedInProjection === false ? "Not included" : "Included"}</button>
-                </article>)}</div>
-                {visibleBills.filter((bill) => !bill.paid).length === 0 && <div className="compact-empty"><strong>All known bills are paid.</strong><span>Add another bill in the calendar if something is missing.</span></div>}
-              </section> : <section className="panel yearly-snapshot-card">
-                <p className="eyebrow">YEAR-TO-DATE</p><h2>{yearlyTotals.monthsWithData} months with data</h2>
-                <div className="three-line-summary"><span>Actual spending</span><strong>{money.format(yearlyTotals.spent)}</strong><span>Known bills remaining</span><strong>{money.format(yearlyTotals.remainingBills)}</strong><span>Projected balance</span><strong>{money.format(yearlyTotals.projectedBalance)}</strong></div>
-              </section>}
+            <div className="spending-bills-grid">
+              <section className="surface spending-breakdown">
+                <div className="section-heading"><div><p className="eyebrow">ACTUAL SPENDING SUMMARY</p><h2>Where your money went</h2></div><button className="text-button" onClick={() => navigate("activity")}>All spending <Icon name="arrow" size={16} /></button></div>
+                <div className="spending-visual"><SpendingRing categories={dashboardCategories} total={dashboardTotals.spent} money={(amount) => money.format(amount)} onSelect={setCategoryDetail} /><div className="spending-summary-note"><span>{dashboardTotals.spent ? "Largest category" : "Make the first update"}</span><strong>{dashboardTotals.spent ? sortedCategories[0].name : "Import your spending"}</strong><p>{dashboardTotals.spent ? `${money.format(sortedCategories[0].spent)} · ${Math.round(sortedCategories[0].spent / dashboardTotals.spent * 100)}% of all spending` : "A bank CSV fills in the categories for you."}</p>{!dashboardTotals.spent && <button className="text-button" onClick={() => setDialog("import")}>Choose a file <Icon name="arrow" size={16} /></button>}</div></div>
+                <div className="category-list">{shownCategories.map((category) => <button className="category-list-row" key={category.id} onClick={() => setCategoryDetail(category.id)}><span className="category-icon" style={{ color: category.color, background: category.soft }}><Icon name={category.id} /></span><span className="category-list-name"><strong>{category.name}</strong><span className="category-mini-track"><i style={{ width: `${dashboardTotals.spent ? category.spent / dashboardTotals.spent * 100 : 0}%`, background: category.color }} /></span></span><strong>{money.format(category.spent)}</strong><Icon name="chevron" size={16} /></button>)}</div>
+                <button className="panel-footer-button" onClick={() => setAllCategoriesVisible((value) => !value)}>{allCategoriesVisible ? "Show fewer categories" : `Show all ${spendingCategories.length} categories`}</button>
+              </section>
+              <section className="surface bills-focus">
+                <div className="section-heading"><div><p className="eyebrow">{dashboardView === "monthly" ? "REMAINING BILLS THIS MONTH" : "YEAR TO DATE"}</p><h2>{dashboardView === "monthly" ? "Your bill checklist" : "Monthly picture"}</h2></div><button className="icon-button" aria-label="Add a bill or subscription" onClick={() => openBill(null)}><Icon name="plus" /></button></div>
+                {dashboardView === "monthly" ? <><div className="checklist-summary"><strong>{money.format(totals.remainingBills)}<small>left to pay</small></strong><span>{paidBills.length} of {visibleBills.length} paid</span></div>
+                <div className="segmented-tabs" aria-label="Bills status"><button aria-pressed={billTab !== "paid"} className={billTab !== "paid" ? "active" : ""} onClick={() => setBillTab("unpaid")}>To pay <span>{unpaidBills.length}</span></button><button aria-pressed={billTab === "paid"} className={billTab === "paid" ? "active" : ""} onClick={() => setBillTab("paid")}>Paid <span>{paidBills.length}</span></button></div>
+                <div className="checklist">{(billTab === "paid" ? paidBills : unpaidBills).slice(0, 6).map(renderBill)}</div>
+                {(billTab === "paid" ? paidBills : unpaidBills).length === 0 && <div className="calm-empty"><Icon name="check" size={28} /><strong>{billTab === "paid" ? "No paid bills yet" : "Your checklist is clear"}</strong><p>{billTab === "paid" ? "Check a bill when you have paid it." : "Add a bill if something is still coming up."}</p></div>}
+                <button className="panel-footer-button" onClick={() => navigate("calendar")}>Manage bills & subscriptions <Icon name="arrow" size={16} /></button></> : <><div className="checklist-summary"><strong>{yearlyTotals.monthsWithData}<small>months with data</small></strong></div><div className="year-totals"><span>Income received</span><strong>{money.format(yearlyTotals.incomeReceived)}</strong><span>Still expected</span><strong>{money.format(yearlyTotals.expectedIncome)}</strong><span>Actual spending</span><strong>{money.format(yearlyTotals.spent)}</strong><span>Unpaid bills</span><strong>{money.format(yearlyTotals.remainingBills)}</strong></div></>}
+                {dashboardView === "monthly" && dashboardTotals.reviewNeeded > 0 && <button className="review-nudge" onClick={() => { navigate("activity"); setActivityTab("review"); }}><span className="review-nudge-icon"><Icon name="review" /></span><span><strong>{dashboardTotals.reviewNeeded} transactions need review</strong><small>A few categories need your help.</small></span><Icon name="chevron" size={16} /></button>}
+              </section>
             </div>
 
             {dashboardView === "yearly" && <section className="panel year-overview">
@@ -1511,48 +1176,11 @@ export default function Home() {
         )}
 
         {active === "calendar" && (
-          <div className="module-page">
-            <section className="module-stats">
-              <article><span>Known monthly bills</span><strong>{money.format(monthlyBillTotal)}</strong><small>Recurring schedule</small></article>
-              <article><span>Remaining this month</span><strong>{money.format(totals.remainingBills)}</strong><small>Included in projection</small></article>
-              <article><span>Paid this month</span><strong>{visibleBills.filter((bill) => bill.paid).length}</strong><small>of {visibleBills.length} bills</small></article>
-            </section>
-            <div className="module-grid calendar-layout">
-              <section className="panel calendar-panel">
-                <div className="panel-heading"><div><p className="eyebrow">PAYMENT CALENDAR</p><h2>{monthLabel}</h2></div><span className="live-pill">Budget linked</span></div>
-                <div className="calendar-weekdays">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <span key={day}>{day}</span>)}</div>
-                <div className="calendar-grid">
-                  {calendarDays.map((day, index) => {
-                    const bills = day ? visibleBills.filter((bill) => bill.dueDay === day) : [];
-                    return <div className={bills.length ? "calendar-day has-bill" : "calendar-day"} key={`${day}-${index}`}>
-                      {day && <><span className="day-number">{day}</span>{bills.slice(0, 3).map((bill) => <button className={bill.paid ? "paid" : ""} key={bill.id} onClick={() => document.getElementById(bill.id)?.scrollIntoView({ behavior: "smooth", block: "center" })}>{bill.paid ? "✓ " : ""}{bill.name}<small>{money.format(bill.paid ? bill.paidAmount ?? bill.amount : bill.amount)}</small></button>)}{bills.length > 3 && <small>+{bills.length - 3} more</small>}</>}
-                    </div>;
-                  })}
-                </div>
-              </section>
-              <section className="panel bill-list-panel">
-                <div className="panel-heading"><div><p className="eyebrow">RECURRING</p><h2>Bills & subscriptions</h2></div><span className="live-pill">Editable</span></div>
-                <p className="section-note">Recurring details continue into future months. Paid status and projection inclusion apply only to the selected month.</p>
-                <div className="recurring-form">
-                  <label className="recurring-name"><span>Name</span><input value={billDraft.name} placeholder="New subscription" onChange={(event) => setBillDraft((current) => ({ ...current, name: event.target.value }))} /></label>
-                  <label><span>Category</span><select value={billDraft.categoryId} onChange={(event) => setBillDraft((current) => ({ ...current, categoryId: event.target.value }))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label>
-                  <label><span>Frequency</span><select value={billDraft.frequency} onChange={(event) => setBillDraft((current) => ({ ...current, frequency: event.target.value as Bill["frequency"] }))}><option value="Monthly">Monthly</option><option value="Annual">Annual</option></select></label>
-                  <label className="compact-field"><span>Due</span><input aria-label="New recurring expense due day" type="number" min="1" max="28" value={billDraft.dueDay} onChange={(event) => setBillDraft((current) => ({ ...current, dueDay: Math.min(28, Math.max(1, Number(event.target.value) || 1)) }))} /></label>
-                  <CurrencyInput value={billDraft.amount} onChange={(amount) => setBillDraft((current) => ({ ...current, amount }))} ariaLabel="New recurring expense amount" />
-                  <button className="add-recurring-button" onClick={addBill}>+ Add</button>
-                </div>
-                <div className="bill-list">
-                  {plan.bills.map((bill) => <div className="bill-row" id={bill.id} key={bill.id}>
-                    <button className={bill.paid ? "bill-status paid" : "bill-status"} onClick={() => toggleBillPaid(bill.id)}><span>{bill.paid ? "✓" : "○"}</span>{bill.paid ? "Paid" : "Unpaid"}</button>
-                    <div><strong>{bill.name}</strong><small>{spendingCategories.find((item) => item.id === canonicalSpendingCategory(bill.categoryId))?.name} · {bill.frequency}</small></div>
-                    <label className="compact-field"><span>Due</span><input aria-label={`${bill.name} due day`} type="number" min="1" max="28" value={bill.dueDay} onChange={(event) => updateBill(bill.id, { dueDay: Math.min(28, Math.max(1, Number(event.target.value) || 1)) })} /></label>
-                    <CurrencyInput value={bill.amount} onChange={(amount) => updateBill(bill.id, { amount })} ariaLabel={`${bill.name} amount`} />
-                    <button className={bill.includedInProjection === false ? "projection-toggle excluded" : "projection-toggle"} onClick={() => toggleBillProjection(bill.id)}>{bill.includedInProjection === false ? "Not included" : "In projection"}</button>
-                    <button className="delete-bill-button" aria-label={`Delete ${bill.name}`} onClick={() => deleteBill(bill.id)}>×</button>
-                  </div>)}
-                </div>
-              </section>
-            </div>
+          <div className="module-page bills-page">
+            <div className="page-summary"><div><p className="eyebrow">STILL COMING UP</p><h2>{money.format(totals.remainingBills)}</h2><p>{unpaidBills.length} unpaid bills · {paidBills.length} paid this month</p></div><button className="button-primary" onClick={() => openBill(null)}><Icon name="plus" size={18} /> Add bill or subscription</button></div>
+            <div className="bill-workspace-controls"><div className="segmented-tabs" aria-label="Bills status">{([["unpaid", "To pay"], ["paid", "Paid"], ["all", "All recurring"]] as const).map(([id, label]) => <button key={id} className={billTab === id ? "active" : ""} aria-pressed={billTab === id} onClick={() => setBillTab(id)}>{label}</button>)}</div><div className="view-toggle" aria-label="Bills display"><button className={billView === "list" ? "active" : ""} aria-pressed={billView === "list"} onClick={() => setBillView("list")}><Icon name="activity" size={16} /> List</button><button className={billView === "calendar" ? "active" : ""} aria-pressed={billView === "calendar"} onClick={() => setBillView("calendar")}><Icon name="calendar" size={16} /> Calendar</button></div></div>
+            {billView === "calendar" && <section className="surface calendar-panel"><div className="section-heading"><h2>{monthLabel}</h2><span className="muted">Tap a bill to edit</span></div><div className="calendar-weekdays">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <span key={day}>{day}</span>)}</div><div className="calendar-grid">{calendarDays.map((day, index) => { const bills = day ? listedBills.filter((bill) => billIsVisible(bill, plan.month) && Math.min(bill.dueDay, new Date(selectedYear, selectedMonth, 0).getDate()) === day) : []; return <div className={bills.length ? "calendar-day has-bill" : "calendar-day"} key={`${day}-${index}`}>{day && <><span className="day-number">{day}</span>{bills.map((bill) => <button key={bill.id} aria-label={`${bill.name}, ${bill.paid ? "paid" : "unpaid"}, ${money.format(bill.amount)}, due ${billDueLabel(bill)}`} className={bill.paid ? "paid" : ""} onClick={() => openBill(bill.id)}>{bill.paid ? "✓ " : ""}{bill.name}<small>{money.format(bill.amount)}</small></button>)}</>}</div>; })}</div></section>}
+            <section className="surface bill-agenda"><div className="section-heading"><h2>{billTab === "paid" ? "Paid this month" : billTab === "all" ? "Recurring bills & subscriptions" : "To pay this month"}</h2><span className="muted">{listedBills.length} items</span></div><div className="checklist">{listedBills.map(renderBill)}</div>{listedBills.length === 0 && <div className="calm-empty"><Icon name="calendar" size={32} /><strong>{billTab === "paid" ? "No bills marked paid" : "Nothing on this list"}</strong><p>Use the checkbox when you pay a bill, or add another recurring expense.</p></div>}</section>
           </div>
         )}
 
@@ -1591,7 +1219,7 @@ export default function Home() {
                 </section>;
               })}
             </div>
-            <section className="connection-note"><span>↔</span><div><strong>Connected to your monthly budget</strong><p>Minimum and extra payments automatically update the Debt allocation and your available paycheck balance.</p></div></section>
+            <section className="connection-note"><span>↔</span><div><strong>Debt details stay together</strong><p>Payment amounts are saved with your debt plan. Record a paid payment or add a known bill to include it in the monthly balance.</p></div></section>
           </div>
         )}
 
@@ -1599,7 +1227,7 @@ export default function Home() {
           <div className="module-page">
             <section className="module-stats">
               <article><span>Saved toward goals</span><strong>{money.format(plan.goals.reduce((sum, goal) => sum + goal.current, 0))}</strong><small>Current balances</small></article>
-              <article><span>Monthly contribution</span><strong>{money.format(plan.goals.reduce((sum, goal) => sum + goal.monthly, 0))}</strong><small>Linked to Savings</small></article>
+              <article><span>Monthly contribution</span><strong>{money.format(plan.goals.reduce((sum, goal) => sum + goal.monthly, 0))}</strong><small>Optional contribution goal</small></article>
               <article><span>Goal target</span><strong>{money.format(plan.goals.reduce((sum, goal) => sum + goal.target, 0))}</strong><small>Across {plan.goals.length} goals</small></article>
             </section>
             <div className="goal-grid">
@@ -1627,7 +1255,7 @@ export default function Home() {
         {active === "investing" && (
           <div className="module-page investing-page">
             <section className="module-hero investing-hero">
-              <div><p className="eyebrow">MONTHLY RESOURCE</p><h2>Invest from the paycheck, on purpose.</h2><span>This amount is subtracted from available income and added to your full-plan dashboard.</span></div>
+              <div><p className="eyebrow">MONTHLY RESOURCE</p><h2>Invest from the paycheck, on purpose.</h2><span>Set an optional contribution amount here. Planning an investment does not count it as actual spending.</span></div>
               <div className="hero-input"><span>Invest each month</span><CurrencyInput value={plan.investmentMonthly} onChange={updateInvestmentMonthly} ariaLabel="Monthly investing allocation" /></div>
             </section>
             <div className="module-grid investing-layout">
@@ -1638,7 +1266,7 @@ export default function Home() {
                   <span className="investment-number">0{index + 1}</span><div><strong>{bucket.name}</strong><small>{money.format(plan.investmentMonthly * bucket.percent / 100)} / month</small></div>
                   <div className="investment-slider"><input aria-label={`${bucket.name} percent`} type="range" min="0" max="100" value={bucket.percent} onChange={(event) => setPlan((current) => ({ ...current, investmentBuckets: current.investmentBuckets.map((item) => item.id === bucket.id ? { ...item, percent: Number(event.target.value) } : item) }))} /><NumberInput value={bucket.percent} onChange={(percent) => setPlan((current) => ({ ...current, investmentBuckets: current.investmentBuckets.map((item) => item.id === bucket.id ? { ...item, percent: Math.min(100, percent) } : item) }))} ariaLabel={`${bucket.name} allocation percent`} suffix="%" /></div>
                 </div>)}
-                {bucketPercent !== 100 && <p className="allocation-warning">Adjust allocations to exactly 100%. The monthly budget still uses the total contribution above.</p>}
+                {bucketPercent !== 100 && <p className="allocation-warning">Adjust the percentages to total 100% of the contribution amount.</p>}
               </section>
               <aside className="panel paycheck-bridge">
                 <p className="eyebrow">PAYCHECK BRIDGE</p><h2>{money.format(plan.investmentMonthly)}</h2><span>of {money.format(totals.income)} monthly income</span>
@@ -1650,60 +1278,15 @@ export default function Home() {
         )}
 
         {active === "activity" && (
-          <div className="module-page">
-            <section className="statement-import-panel panel">
-              <div className="panel-heading"><div><p className="eyebrow">FASTEST WAY TO UPDATE SPENDING</p><h2>Import a bank or card statement</h2></div><span className="local-pill">Runs on this device</span></div>
-              <p className="section-note">Download a CSV from your bank, then upload it here. Paycheck detects spending, applies merchant rules, skips duplicates, matches clear bill payments, and flags only exceptions.</p>
-              <div className="statement-actions">
-                <button className="primary-button" onClick={() => statementInputRef.current?.click()}>Upload CSV statement</button>
-                <input ref={statementInputRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={handleStatementFile} />
-                <label><span>Account or payment method</span><input value={importAccount} placeholder="Checking or Visa" onChange={(event) => { setImportAccount(event.target.value); if (statementText) prepareStatement(statementText, importMode, event.target.value); }} /></label>
-                {statementText && <label><span>Charges appear as</span><select value={importMode} onChange={(event) => { const mode = event.target.value as ImportAmountMode; setImportMode(mode); prepareStatement(statementText, mode); }}><option value="negative">Negative amounts</option><option value="positive">Positive amounts</option></select></label>}
-              </div>
-              {importError && <p className="import-error">{importError}</p>}
-              {importPreview.length > 0 && <div className="import-preview">
-                <div className="import-preview-heading"><div><strong>{statementName}</strong><small>{importPreview.filter((item) => !item.duplicate).length} new · {importPreview.filter((item) => item.duplicate).length} duplicate · {importPreview.filter((item) => item.reviewNeeded && !item.duplicate).length} need review</small></div><button className="primary-button" onClick={importStatementTransactions}>Import new transactions</button></div>
-                <div className="import-preview-list">{importPreview.slice(0, 8).map((item) => <div className={item.duplicate ? "import-preview-row duplicate" : "import-preview-row"} key={item.id}>
-                  <span>{item.date}</span><strong>{item.description}</strong><b>{money.format(item.amount)}</b>
-                  <select aria-label={`Category for ${item.description}`} value={item.categoryId} disabled={item.duplicate} onChange={(event) => setImportPreview((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, categoryId: event.target.value, reviewNeeded: event.target.value === "other-uncategorized" } : candidate))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select>
-                  <small>{item.duplicate ? "Already imported" : item.reviewNeeded ? "Review needed" : "Ready"}</small>
-                </div>)}</div>
-                {importPreview.length > 8 && <small className="preview-more">+ {importPreview.length - 8} more transactions will follow the same rules.</small>}
-              </div>}
-            </section>
-
-            <section className="transaction-entry panel">
-              <div className="panel-heading"><div><p className="eyebrow">QUICK ENTRY</p><h2>Add one transaction</h2></div><span className="live-pill">Optional</span></div>
-              <p className="section-note">Only the essentials. Leave the category as Other and Paycheck will try the merchant rules when you add it.</p>
-              <div className="transaction-form">
-                <label><span>Date</span><input type="date" value={transactionDraft.date} onChange={(event) => setTransactionDraft((current) => ({ ...current, date: event.target.value }))} /></label>
-                <label className="description-field"><span>Description / merchant</span><input placeholder="Example: Publix" value={transactionDraft.description} onBlur={() => setTransactionDraft((current) => current.categoryId === "other-uncategorized" ? { ...current, categoryId: categorizeMerchant(current.description, plan.merchantRules) } : current)} onChange={(event) => setTransactionDraft((current) => ({ ...current, description: event.target.value }))} /></label>
-                <label><span>Category</span><select value={transactionDraft.categoryId} onChange={(event) => setTransactionDraft((current) => ({ ...current, categoryId: event.target.value }))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label>
-                <label><span>Account</span><input value={transactionDraft.account} placeholder="Checking" onChange={(event) => setTransactionDraft((current) => ({ ...current, account: event.target.value }))} /></label>
-                <label><span>Amount</span><CurrencyInput value={transactionDraft.amount} onChange={(amount) => setTransactionDraft((current) => ({ ...current, amount }))} ariaLabel="Transaction amount" /></label>
-                <button className="primary-button" onClick={addTransaction}>Add transaction</button>
-              </div>
-            </section>
-            <section className="module-stats transaction-stats">
-              <article><span>Actual spending</span><strong>{money.format(totals.spent)}</strong><small>Transactions and paid bills</small></article>
-              <article><span>Transactions</span><strong>{plan.transactions.length}</strong><small>{monthLabel}</small></article>
-              <article><span>Review needed</span><strong>{reviewTransactions.length}</strong><small>Unrecognized merchants</small></article>
-            </section>
-
-            {reviewTransactions.length > 0 && <section className="panel review-panel">
-              <div className="panel-heading"><div><p className="eyebrow">EXCEPTIONS ONLY</p><h2>Review needed</h2></div><span className="review-count">{reviewTransactions.length}</span></div>
-              <p className="section-note">Choose a category once. “Categorize & remember” creates a local merchant rule for similar transactions.</p>
-              <div className="review-list">{reviewTransactions.map((transaction) => <div className="review-row" key={transaction.id}>
-                <div><strong>{transaction.description}</strong><small>{transaction.date} · {transaction.account || transaction.owner || "Household"}</small></div>
-                <b>{money.format(transaction.amount)}</b>
-                <select value={transaction.categoryId} onChange={(event) => updateTransactionCategory(transaction.id, event.target.value, false, true)}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select>
-                <div className="review-actions"><button disabled={transaction.categoryId === "other-uncategorized"} onClick={() => updateTransactionCategory(transaction.id, transaction.categoryId)}>Done</button><button disabled={transaction.categoryId === "other-uncategorized"} onClick={() => updateTransactionCategory(transaction.id, transaction.categoryId, true)}>Remember</button></div>
-              </div>)}</div>
-            </section>}
-
-            <section className="panel transaction-panel">
-              <div className="panel-heading"><div><p className="eyebrow">ACTIVITY</p><h2>Transactions</h2></div><label className="transaction-filter"><span>Show</span><select value={transactionCategoryFilter} onChange={(event) => setTransactionCategoryFilter(event.target.value)}><option value="all">All categories</option>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label></div>
-              {filteredTransactions.length === 0 ? <div className="empty-state"><span>≡</span><h3>No transactions here yet</h3><p>Upload a CSV statement or add a single transaction above.</p></div> : <div className="transaction-table"><div className="transaction-head"><span>Date</span><span>Description</span><span>Category</span><span>Account</span><span>Amount</span><span /></div>{filteredTransactions.map((transaction) => <div className="transaction-row" key={transaction.id}><span>{transaction.date}</span><strong>{transaction.description}</strong><span>{spendingCategories.find((item) => item.id === canonicalSpendingCategory(transaction.categoryId))?.name}</span><span>{transaction.account || transaction.owner || "Household"}</span><strong>{money.format(transaction.amount)}</strong><button aria-label={`Delete ${transaction.description}`} onClick={() => deleteTransaction(transaction.id)}>×</button></div>)}</div>}
+          <div className="module-page spending-page">
+            <div className="page-summary"><div><p className="eyebrow">ACTUAL SPENDING</p><h2>{money.format(totals.spent)}</h2><p>{plan.transactions.length} transactions, paid bills, and category totals</p></div><span className="local-summary"><Icon name="lock" size={16} /> Stored on this device</span></div>
+            <button className="import-banner" onClick={() => setDialog("import")}><span className="import-banner-icon"><Icon name="upload" size={24} /></span><span><strong>Bring your spending into focus</strong><small>Import a bank CSV. Review only what needs your help.</small></span><span className="import-banner-action">Import statement <Icon name="arrow" size={18} /></span></button>
+            <section className="surface spending-ledger">
+              <div className="ledger-toolbar"><div className="segmented-tabs" aria-label="Transaction view"><button className={activityTab === "all" ? "active" : ""} aria-pressed={activityTab === "all"} onClick={() => setActivityTab("all")}>All transactions</button><button className={activityTab === "review" ? "active" : ""} aria-pressed={activityTab === "review"} onClick={() => setActivityTab("review")}>Review needed <span>{reviewTransactions.length}</span></button></div><span className="muted">{filteredTransactions.length} shown</span></div>
+              <div className="ledger-filters"><label className="search-field"><Icon name="search" size={18} /><input aria-label="Search transactions" placeholder="Search merchant or account" value={transactionSearch} onChange={(event) => setTransactionSearch(event.target.value)} />{transactionSearch && <button className="icon-button" aria-label="Clear search" onClick={() => setTransactionSearch("")}><Icon name="close" size={16} /></button>}</label><select aria-label="Filter spending category" value={transactionCategoryFilter} onChange={(event) => setTransactionCategoryFilter(event.target.value)}><option value="all">All categories</option>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></div>
+              {activityTab === "review" && reviewTransactions.length > 0 && <p className="review-help">Choose a category, then confirm. “Remember” also categorizes similar merchants next time.</p>}
+              <div className="ledger-list">{filteredTransactions.map((transaction) => { const category = spendingCategories.find((item) => item.id === canonicalSpendingCategory(transaction.categoryId)); return <article className={transaction.reviewNeeded ? "ledger-item needs-review" : "ledger-item"} key={transaction.id}><div className="ledger-primary"><span className="category-icon" style={{ color: category?.color, background: category?.soft }}><Icon name={category?.id || "activity"} /></span><div className="ledger-merchant"><strong>{transaction.description}</strong><small>{new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(`${transaction.date}T12:00:00`))} · {transaction.account || transaction.owner || "Household"}{transaction.billId ? " · Matched bill" : ""}</small></div><strong className="ledger-amount">{money.format(transaction.amount)}</strong><button className="icon-button delete-transaction" aria-label={`Delete ${transaction.description}`} onClick={() => { if (window.confirm(`Delete ${transaction.description}? This removes ${money.format(transaction.amount)} from spending.`)) deleteTransaction(transaction.id); }}><Icon name="close" size={16} /></button></div><div className="ledger-secondary"><select aria-label={`Category for ${transaction.description}`} value={transaction.categoryId} onChange={(event) => updateTransactionCategory(transaction.id, event.target.value, false, transaction.reviewNeeded)}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select>{transaction.reviewNeeded ? <div className="review-actions"><button disabled={transaction.categoryId === "other-uncategorized"} onClick={() => updateTransactionCategory(transaction.id, transaction.categoryId)}><Icon name="check" size={16} /> Confirm</button><button disabled={transaction.categoryId === "other-uncategorized"} onClick={() => updateTransactionCategory(transaction.id, transaction.categoryId, true)}>Remember</button></div> : <span className="ledger-status"><Icon name="check" size={14} /> {transaction.source === "import" ? "Imported" : "Recorded"}</span>}</div></article>; })}</div>
+              {filteredTransactions.length === 0 && <div className="calm-empty"><Icon name={activityTab === "review" ? "check" : "activity"} size={32} /><strong>{activityTab === "review" && !transactionSearch && transactionCategoryFilter === "all" ? "You’re all caught up" : "No transactions here"}</strong><p>{activityTab === "review" ? "Only items needing a category will appear here." : "Import a statement, add spending, or adjust your filters."}</p>{activityTab === "all" && !plan.transactions.length && <button className="button-primary" onClick={() => setDialog("import")}><Icon name="upload" size={18} /> Import CSV</button>}</div>}
             </section>
 
             <details className="panel manual-totals-panel">
@@ -1730,7 +1313,7 @@ export default function Home() {
             <div className="module-grid worth-layout">
               <section className="panel account-panel">
                 <div className="panel-heading"><div><p className="eyebrow">WHAT YOU OWN</p><h2>Assets</h2></div><strong>{money.format(totals.assets)}</strong></div>
-                <p className="section-note">Account categories are based on the checking, business, crypto, investment, and vehicle sections in your workbook.</p>
+                <p className="section-note">Update balances here to see what you own after debt.</p>
                 {plan.assets.map((asset) => <div className="account-row" key={asset.id}><span className="account-icon">{asset.name.slice(0, 1)}</span><div><strong>{asset.name}</strong><small>{asset.type}</small></div><CurrencyInput value={asset.balance} onChange={(balance) => setPlan((current) => ({ ...current, assets: current.assets.map((item) => item.id === asset.id ? { ...item, balance } : item) }))} ariaLabel={`${asset.name} account balance`} /></div>)}
               </section>
               <section className="panel account-panel liability-panel">
@@ -1778,7 +1361,54 @@ export default function Home() {
         )}
       </section>
     </main>
-    {notice && <div className="app-notice" role="status">{notice}<button aria-label="Dismiss message" onClick={() => setNotice("")}>×</button></div>}
+    <nav className="mobile-nav" aria-label="Mobile navigation">{navItems.slice(0, 3).map(([id, icon, label]) => <button key={id} className={active === id ? "active" : ""} aria-current={active === id ? "page" : undefined} onClick={() => navigate(id)}><Icon name={icon} /><span>{id === "calendar" ? "Bills" : label}</span>{id === "activity" && reviewTransactions.length > 0 && <b>{reviewTransactions.length}</b>}</button>)}<button className={!navItems.slice(0, 3).some(([id]) => id === active) ? "active" : ""} onClick={() => setDialog("more")}><Icon name="more" /><span>More</span></button></nav>
+    <ActionDialog open={dialog === "more"} onClose={() => setDialog(null)} title="More tools"><div className="more-tools">{navItems.slice(3).map(([id, icon, label]) => <button key={id} onClick={() => navigate(id)}><Icon name={icon} /><span>{label}</span><Icon name="chevron" size={16} /></button>)}<button onClick={() => { setDialog(null); setSettingsOpen(true); }}><Icon name="lock" /><span>Save & restore</span><Icon name="chevron" size={16} /></button></div></ActionDialog>
+    <ActionDialog notice={notice} open={dialog === "transaction"} onClose={() => setDialog(null)} title="Add spending" subtitle="A quick entry for a purchase or expense.">
+              <div className="transaction-form">
+                <label><span>Date</span><input type="date" value={transactionDraft.date} onChange={(event) => setTransactionDraft((current) => ({ ...current, date: event.target.value }))} /></label>
+                <label className="description-field"><span>Description / merchant</span><input placeholder="Example: Publix" value={transactionDraft.description} onBlur={() => setTransactionDraft((current) => current.categoryId === "other-uncategorized" ? { ...current, categoryId: categorizeMerchant(current.description, plan.merchantRules) } : current)} onChange={(event) => setTransactionDraft((current) => ({ ...current, description: event.target.value }))} /></label>
+                <label><span>Category</span><select value={transactionDraft.categoryId} onChange={(event) => setTransactionDraft((current) => ({ ...current, categoryId: event.target.value }))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></label>
+                <label><span>Account</span><input value={transactionDraft.account} placeholder="Checking" onChange={(event) => setTransactionDraft((current) => ({ ...current, account: event.target.value }))} /></label>
+                <label><span>Amount</span><CurrencyInput value={transactionDraft.amount} onChange={(amount) => setTransactionDraft((current) => ({ ...current, amount }))} ariaLabel="Transaction amount" /></label>
+                <button className="primary-button" onClick={addTransaction}>Add transaction</button>
+              </div>
+
+    </ActionDialog>
+    <ActionDialog open={dialog === "import"} onClose={() => setDialog(null)} title="Import your spending" subtitle="Your file stays on this device." wide>
+            <section className="statement-import-panel">
+              <div className="import-steps"><span className={!statementText ? "active" : ""}>1. Choose file</span><span className={statementText ? "active" : ""}>2. Check & import</span></div>
+              <p className="section-note">Download a CSV from your bank or card account. Choose the account below so repeat imports can be recognized.</p><button className="import-dropzone" onClick={() => statementInputRef.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void readStatementFile(file); }}><Icon name="upload" size={30} /><strong>{statementName || "Drop a CSV here, or choose a file"}</strong><span>CSV only · up to 10 MB · processed on your device</span></button>
+              <div className="statement-actions">
+                <button className="primary-button" onClick={() => statementInputRef.current?.click()}>Upload CSV statement</button>
+                <input ref={statementInputRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={handleStatementFile} />
+                <label><span>Account or payment method</span><input value={importAccount} placeholder="Checking or Visa" onChange={(event) => { setImportAccount(event.target.value); if (statementText) prepareStatement(statementText, importMode, event.target.value); }} /></label>
+                {statementText && <label><span>Charges appear as</span><select value={importMode} onChange={(event) => { const mode = event.target.value as ImportAmountMode; setImportMode(mode); prepareStatement(statementText, mode); }}><option value="negative">Negative amounts</option><option value="positive">Positive amounts</option></select></label>}
+              </div>
+              {importError && <p className="import-error">{importError}</p>}
+              {importPreview.length > 0 && <div className="import-preview">
+                <div className="import-preview-heading"><div><strong>{statementName}</strong><small>{importPreview.filter((item) => !item.duplicate).length} new · {importPreview.filter((item) => item.duplicate).length} duplicate · {importPreview.filter((item) => item.reviewNeeded && !item.duplicate).length} need review</small></div><button className="primary-button" onClick={importStatementTransactions}>Import new transactions</button></div>
+                <div className="import-preview-list">{importPreview.map((item) => <div className={item.duplicate ? "import-preview-row duplicate" : "import-preview-row"} key={item.id}>
+                  <span>{item.date}</span><strong>{item.description}</strong><b>{money.format(item.amount)}</b>
+                  <select aria-label={`Category for ${item.description}`} value={item.categoryId} disabled={item.duplicate} onChange={(event) => setImportPreview((current) => current.map((candidate) => candidate.id === item.id ? { ...candidate, categoryId: event.target.value, reviewNeeded: event.target.value === "other-uncategorized" } : candidate))}>{spendingCategories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select>
+                  <small>{item.duplicate ? "Already imported" : item.reviewNeeded ? "Review needed" : "Ready"}</small>
+                </div>)}</div>
+
+              </div>}
+            </section>
+
+
+    </ActionDialog>
+    <ActionDialog open={dialog === "income"} onClose={() => setDialog(null)} title="Monthly income" subtitle={monthLabel}>
+      <div className="income-detail-total"><span>Total monthly income</span><strong>{money.format(totals.income)}</strong></div>
+      <div className="income-editor">{plan.incomes.map((income) => <section key={income.id}><h3>{income.name}<small>{income.owner}</small></h3><div className="form-pair"><label><span>Received</span><CurrencyInput value={income.amount} onChange={(amount) => updateIncome(income.id, amount)} ariaLabel={`${income.name} received`} /></label><label><span>Still expected</span><CurrencyInput value={income.expectedRemaining || 0} onChange={(amount) => updateExpectedIncome(income.id, amount)} ariaLabel={`${income.name} still expected`} /></label></div></section>)}</div><button className="button-primary dialog-done" onClick={() => setDialog(null)}>Done</button>
+    </ActionDialog>
+    <ActionDialog notice={notice} open={dialog === "bill"} onClose={() => setDialog(null)} title={editingBill ? editingBill.name : "Add a bill or subscription"} subtitle={editingBill ? "Changes save as you go." : "Set it up once, then check it off each month."}>
+      {editingBill ? <div className="bill-editor"><div className="bill-edit-status"><PaidCheckbox name={editingBill.name} paid={Boolean(editingBill.paid)} disabled={Boolean(editingBill.matchedTransactionId)} onChange={() => toggleBillPaid(editingBill.id)} /><strong>{editingBill.paid ? "Paid" : "Not paid yet"}</strong><span>{editingBill.matchedTransactionId ? "Matched to a transaction" : monthLabel}</span></div><div className="field-label">Apply detail changes to</div><div className="segmented-tabs"><button className={billEditScope === "month" ? "active" : ""} aria-pressed={billEditScope === "month"} onClick={() => setBillEditScope("month")}>This month only</button><button className={billEditScope === "future" ? "active" : ""} aria-pressed={billEditScope === "future"} onClick={() => setBillEditScope("future")}>This & future months</button></div><div className="form-pair"><label><span>Amount</span><CurrencyInput value={editingBill.amount} disabled={Boolean(editingBill.matchedTransactionId)} onChange={(amount) => editBill({ amount })} ariaLabel={`${editingBill.name} amount`} /></label><label><span>Due day</span><input aria-label={`${editingBill.name} due day`} type="number" min="1" max="31" value={editingBill.dueDay} onChange={(event) => editBill({ dueDay: Math.max(1, Math.min(31, Number(event.target.value) || 1)) })} /></label></div><label><span>Category</span><select value={editingBill.categoryId} disabled={Boolean(editingBill.matchedTransactionId)} onChange={(event) => editBill({ categoryId: event.target.value })}>{spendingCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label><div className="form-pair"><label><span>Repeats</span><select value={editingBill.frequency} onChange={(event) => editBill({ frequency: event.target.value as Bill["frequency"], dueMonth: selectedMonth })}><option>Monthly</option><option>Annual</option></select></label>{editingBill.frequency === "Annual" && <label><span>Due month</span><select value={editingBill.dueMonth || selectedMonth} onChange={(event) => editBill({ dueMonth: Number(event.target.value) })}>{Array.from({ length: 12 }, (_, i) => <option key={i} value={i + 1}>{new Intl.DateTimeFormat("en-US", { month: "long" }).format(new Date(2026, i, 1))}</option>)}</select></label>}</div>{!editingBill.paid && <label className="include-balance"><input type="checkbox" checked={editingBill.includedInProjection !== false} onChange={() => toggleBillProjection(editingBill.id)} /><span>Include in this month’s projected balance</span></label>}<div className="dialog-footer"><button className="text-danger" onClick={() => { if (window.confirm(`Remove ${editingBill.name} from this and future months? Earlier months are kept.`)) { deleteBill(editingBill.id); setDialog(null); } }}>Remove recurring bill</button><button className="button-primary" onClick={() => setDialog(null)}>Done</button></div></div> : <div className="bill-editor"><label><span>Bill or subscription name</span><input value={billDraft.name} placeholder="Rent, electricity, Netflix…" onChange={(event) => setBillDraft((current) => ({ ...current, name: event.target.value }))} /></label><div className="form-pair"><label><span>Amount</span><CurrencyInput value={billDraft.amount} onChange={(amount) => setBillDraft((current) => ({ ...current, amount }))} ariaLabel="New recurring expense amount" /></label><label><span>Due day</span><input aria-label="New recurring expense due day" type="number" min="1" max="31" value={billDraft.dueDay} onChange={(event) => setBillDraft((current) => ({ ...current, dueDay: Math.max(1, Math.min(31, Number(event.target.value) || 1)) }))} /></label></div><div className="form-pair"><label><span>Category</span><select value={billDraft.categoryId} onChange={(event) => setBillDraft((current) => ({ ...current, categoryId: event.target.value }))}>{spendingCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label><span>Repeats</span><select value={billDraft.frequency} onChange={(event) => setBillDraft((current) => ({ ...current, frequency: event.target.value as Bill["frequency"] }))}><option>Monthly</option><option>Annual</option></select></label></div>{billDraft.frequency === "Annual" && <p className="section-note">Due in {monthLabel.split(" ")[0]} each year. You can change the month after adding it.</p>}<button className="button-primary dialog-done" onClick={addBill}>Add bill</button></div>}
+    </ActionDialog>
+    <ActionDialog open={Boolean(detailCategory)} onClose={() => setCategoryDetail(null)} title={detailCategory?.name || "Spending category"} subtitle={dashboardView === "yearly" && active === "dashboard" ? String(dashboardYear) : monthLabel}>
+      <div className="category-detail-total"><span>Actual spending</span><strong>{money.format(detailEntries.reduce((sum, item) => sum + item.amount, 0))}</strong></div><div className="category-detail-list">{detailEntries.map((item) => <article key={item.id}><span><strong>{item.description}</strong><small>{item.date} · {item.note}</small></span><b>{money.format(item.amount)}</b></article>)}</div>{detailEntries.length === 0 && <div className="calm-empty"><Icon name={detailCategory?.id || "activity"} size={32} /><strong>No spending in this category yet</strong><p>Import a statement or add an expense to start.</p></div>}<button className="button-primary dialog-done" onClick={() => { setTransactionDraft((current) => ({ ...current, categoryId: detailCategory?.id || "other-uncategorized" })); setCategoryDetail(null); setDialog("transaction"); }}><Icon name="plus" size={18} /> Add spending</button>
+    </ActionDialog>
+    {notice && <div className="app-notice" role="status">{notice}{undoBill && notice === undoBill.message && undoBill.month === plan.month && <button className="undo-button" onClick={() => { updateBillForThisMonth(undoBill.bill.id, undoBill.bill); setUndoBill(null); setNotice("Payment change undone."); }}>Undo</button>}<button aria-label="Dismiss message" onClick={() => setNotice("")}>×</button></div>}
     {settingsOpen && (
       <div className="modal-backdrop" role="presentation">
         <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">

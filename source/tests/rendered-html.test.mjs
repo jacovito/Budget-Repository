@@ -32,7 +32,7 @@ test("renders development preview metadata", async () => {
   const html = await response.text();
   assert.match(html, developmentPreviewMeta);
   assert.match(html, /Paycheck/);
-  assert.match(html, /Spending and monthly balance\./);
+  assert.match(html, /Your month at a glance/);
   assert.match(html, /Projected monthly balance/i);
   assert.match(html, /Actual spending summary/i);
   assert.match(html, /Remaining bills this month/i);

@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import "./interface.css";
 import PwaClient from "./pwa-client";
 
 const geistSans = Geist({
@@ -16,7 +17,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Paycheck — Household Budget Planner",
   description:
-    "A private, connected monthly budget for income, bills, debt, goals, investing, transactions, and net worth.",
+    "See actual spending by category, check off bills, and know your projected monthly balance. Private, local saving.",
   other: {
     "codex-preview": "development",
   },
@@ -27,7 +28,7 @@ export const metadata: Metadata = {
   },
   manifest: "/manifest.webmanifest",
 };
-export const viewport: Viewport = { themeColor: "#173d35" };
+export const viewport: Viewport = { themeColor: "#172039" };
 
 export default function RootLayout({
   children,

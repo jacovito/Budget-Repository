@@ -1,8 +1,8 @@
 # Paycheck Budget Planner — Product Requirements Document
 
-**Status:** Version 1.0 deployment plan  
+**Status:** Version 2.0 — actual spending and monthly balance
 **Primary audience:** Any person or household using an independent local budget
-**Distribution:** Public installable web app plus downloadable local package  
+**Distribution:** Public installable web app plus downloadable local package
 **Data model:** Local-first; no shared financial database in version 1
 
 ## 1. Product summary
@@ -11,13 +11,21 @@ Paycheck is an actual-spending-first household budgeting application connecting 
 
 The product must work without an OpenAI account and without sending financial information to a collective server. Each browser or locally installed copy stores its own information independently. Users can move a budget by exporting and restoring a `.paycheck` backup.
 
+## Product direction change (September 2026)
+
+This version supersedes v1's emphasis on planned spending, assigned money, and planned-versus-recorded comparison. The primary question is: **What has been spent, which bills are still coming, and will the month finish above or below income?** This is a change in product behavior and requirements, not a rearrangement of dashboard cards.
+
+Category targets remain optional in Monthly Plan. They do not create spending or reduce the projected balance. Debt balances, investment plans, and savings targets likewise never become actual spending merely because they have been entered.
+
+The former exclusion of automatic transaction importing is narrowed: **user-initiated CSV import and local merchant categorization are in scope**. Live bank connections, bank credentials, server-side statement processing, and cloud financial storage remain out of scope. PDF or AI-assisted extraction is a possible future capability requiring a separate design decision; it is not implied by adding CSV import.
+
 ## 2. Problem statement
 
 Spreadsheets can contain the right categories but are difficult to navigate, easy to break, and require manual synchronization. Many budgeting products require accounts, cloud storage, subscriptions, or bank access. Paycheck should provide a modern connected experience while preserving the privacy, portability, and ownership of a spreadsheet.
 
 ## 3. Goals
 
-1. Connect all major household-budgeting tools to one monthly plan.
+1. Make actual spending, unpaid bills, and the projected monthly balance understandable at a glance.
 2. Keep financial information on the user's device by default.
 3. Support independent users without server accounts.
 4. Work offline after installation.
@@ -37,7 +45,7 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 
 ## 5. Users
 
-- **Household planner:** a person or couple planning a full paycheck, bills, goals, and available money.
+- **Household planner:** a person or couple tracking spending, checking bills paid, and protecting a monthly savings goal.
 - **Independent user:** a person opening the public application and receiving a blank workspace stored in their browser.
 - **Local-package user:** a person downloading the ZIP and running Paycheck without internet or OpenAI.
 
@@ -53,20 +61,36 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 - Keep optional category targets in one Monthly Plan area rather than throughout the dashboard.
 - Compare the projection with editable minimum and ideal monthly savings targets.
 
+### Daily interaction and responsive design
+
+- Desktop: persistent navigation, a compact period toolbar, a balance summary, actual-spending breakdown, and bill checklist.
+- Phone: four labeled tabs (Overview, Spending, Bills, More), vertically stacked content, visible merchant/date/account information, and action sheets for entry.
+- Provide a spending ring and category rows using actual amounts only; either opens itemized category detail, including paid bills and direct category totals.
+- Make income, statement import, and spending entry available without traversing the planning tools.
+- Search spending by merchant/account and filter by category or Review Needed.
+- A review queue supports confirming a category and remembering the merchant rule locally.
+- CSV import supports file selection and desktop drag/drop, followed by a review step with a full transaction preview.
+
 ### Bills and calendar
 
 - Display monthly and annual recurring expenses.
 - Track paid/unpaid status and whether each unpaid bill is included in the projection.
 - Move paid bills into actual spending without double-counting them.
+- Use a real checkbox for paid/unpaid status and offer Undo for manual status changes.
+- Offer To pay, Paid, and All recurring lists, plus a calendar view.
+- Put amount, due date, frequency, category, and inclusion controls in an edit panel rather than on every list row.
+- Detail edits can apply to this month only or this and future months. Payment status and projection inclusion stay month-specific.
+- Linked imported payments remain counted once. Clear their recorded transaction before resetting paid status.
+- New months clear payment links and paid states, and keep the recurring schedule.
 
 ### Debt, savings, and investing
 
 - Track balance, APR, minimum payment, extra payment, and estimated payoff.
-- Add debt payments automatically to the monthly budget.
+- Keep minimum and extra payment details in the debt planner. They enter the projection only through recorded spending or a known unpaid bill.
 - Track savings balances, targets, dates, monthly contributions, and progress.
-- Add savings contributions automatically to the Savings allocation.
+- Keep contribution goals distinct from money already saved.
 - Allocate one monthly investing resource among configurable percentage buckets.
-- Reflect investing on the dashboard and budget.
+- Keep investment planning separate from the monthly actual-spending calculation.
 
 ### Transactions, imports, and net worth
 
@@ -155,11 +179,11 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 - Keep IndexedDB as offline cache and `.paycheck` export as an exit path.
 - Enforce household ownership and explicit conflict resolution.
 
-## 13. Version 1 acceptance criteria
+## 13. Current acceptance criteria
 
 1. A person with no OpenAI account can open the public URL.
 2. Two browsers can enter different values without sharing records.
-3. Income, bills, debt, savings, and investing update the dashboard correctly.
+3. Income, actual spending, and unpaid included bills produce the same projected balance in monthly and yearly views; optional plans do not change that formula.
 4. Refresh and offline reopen preserve the local workspace.
 5. Standard and encrypted backups round-trip correctly.
 6. An incorrect password changes no saved information.
@@ -167,6 +191,12 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 8. The local service binds only to `127.0.0.1`.
 9. The release includes a matching SHA-256 checksum.
 10. GitHub download and Cloudflare application URLs are publicly reachable.
+
+11. Checking a bill paid moves the amount from remaining bills to actual spending without changing the projection; Undo restores the prior state.
+12. Matching an imported payment to a bill never counts the payment twice, and a new month clears the previous payment link.
+13. Local CSV imports group spending by date/month, detect repeat imports, and expose unrecognized merchants for review.
+14. Desktop and phone layouts preserve essential transaction details and primary actions, with keyboard-accessible dialogs and reduced-motion support.
+15. Category drilldowns reconcile to the displayed total, including unitemized amounts and manually paid bills.
 
 ## 14. Success measures
 
@@ -178,7 +208,9 @@ Spreadsheets can contain the right categories but are difficult to navigate, eas
 
 ## 15. Decision log
 
-- Local-first storage remains the version 1 authority.
+- Actual spending and projected monthly balance supersede the original planning-led philosophy.
+- Local-first storage remains the authority.
+- User-selected CSV imports are permitted; they do not introduce bank access or cloud finance storage.
 - Public hosting distributes code only.
 - GitHub Releases is the initial independent download location.
 - Cloudflare is the initial independent web host.
