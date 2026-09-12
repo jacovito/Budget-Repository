@@ -1,0 +1,25 @@
+{
+  "name": "statement-to-csv",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/prepare-assets.mjs",
+    "deploy": "wrangler deploy --config wrangler.json",
+    "deploy:preview": "wrangler versions upload --config wrangler.json",
+    "validate": "wrangler deploy --dry-run --config wrangler.json",
+    "test": "node --test tests/parser.test.mjs"
+  },
+  "dependencies": {
+    "@tesseract.js-data/eng": "1.0.0",
+    "pdfjs-dist": "6.3.289",
+    "tesseract.js": "7.0.0",
+    "tesseract.js-core": "7.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.120.1"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
