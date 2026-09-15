@@ -8,7 +8,7 @@
     "deploy": "wrangler deploy --config wrangler.json",
     "deploy:preview": "wrangler versions upload --config wrangler.json",
     "validate": "wrangler deploy --dry-run --config wrangler.json",
-    "test": "node --test tests/parser.test.mjs"
+    "test": "node --test tests/parser.test.mjs tests/pdf-text.test.mjs"
   },
   "dependencies": {
     "@tesseract.js-data/eng": "1.0.0",

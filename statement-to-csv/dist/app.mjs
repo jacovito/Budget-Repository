@@ -1,4 +1,5 @@
 import { CATEGORIES, TYPES, groupSpans, parseLines, rowErrors, exportCsv, inferPeriod, categoryFor } from './parser.mjs';
+import { readPageText } from './pdf-text.mjs';
 
 const $ = s => document.querySelector(s);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -119,7 +120,7 @@ async function openFile(file, forceScan = false) {
       const page = await pdfDocument.getPage(i); const viewport = page.getViewport({ scale: 1 });
       let lines = [];
       if (!forceScan) {
-        const content = await page.getTextContent();
+        const content = await readPageText(page);
         const spans = content.items.filter(item => typeof item.str === 'string').map(item => {
           const [x, y] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
           return { text: item.str, x, y, width: item.width, height: item.height };
